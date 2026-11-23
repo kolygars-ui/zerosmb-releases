@@ -667,7 +667,18 @@ fn script_temp_path(name: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("zerosmb-{name}-{}-{stamp}", std::process::id()))
+    let path = std::path::Path::new(name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("script");
+    let file_name = match path.extension().and_then(|value| value.to_str()) {
+        Some(extension) if !extension.is_empty() => {
+            format!("zerosmb-{stem}-{}-{stamp}.{extension}", std::process::id())
+        }
+        _ => format!("zerosmb-{stem}-{}-{stamp}", std::process::id()),
+    };
+    std::env::temp_dir().join(file_name)
 }
 
 #[cfg(not(target_os = "android"))]
@@ -713,7 +724,31 @@ try {
   __ACTION__
   $svc = Get-Service | Where-Object { $_.Name -eq 'ZeroTierOneService' -or $_.DisplayName -like 'ZeroTier One*' } | Select-Object -First 1
   if (-not $svc) { throw 'Служба ZeroTier One не найдена' }
-  Restart-Service -Name $svc.Name -Force
+  if ($svc.Status -ne 'Stopped') {
+    & sc.exe stop $svc.Name | Out-Null
+    $deadline = (Get-Date).AddSeconds(90)
+    do {
+      Start-Sleep -Milliseconds 500
+      $svc.Refresh()
+    } while ($svc.Status -ne 'Stopped' -and (Get-Date) -lt $deadline)
+  }
+  if ($svc.Status -ne 'Stopped') {
+    Get-Process -Name 'zerotier-one_x64' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    $svc.Refresh()
+  }
+  if ($svc.Status -ne 'Stopped') {
+    throw "Служба ZeroTier One не остановилась: $($svc.Status)"
+  }
+  & sc.exe start $svc.Name | Out-Null
+  $deadline = (Get-Date).AddSeconds(90)
+  do {
+    Start-Sleep -Milliseconds 500
+    $svc.Refresh()
+  } while ($svc.Status -ne 'Running' -and (Get-Date) -lt $deadline)
+  if ($svc.Status -ne 'Running') {
+    throw "Служба ZeroTier One не запустилась: $($svc.Status)"
+  }
   Set-Content -LiteralPath $result -Value 'OK' -Encoding UTF8
 } catch {
   Set-Content -LiteralPath $result -Value $_.Exception.Message -Encoding UTF8
@@ -745,11 +780,6 @@ try {
     let result = read_script_result(&result_path);
     let _ = std::fs::remove_file(&script_path);
     let _ = std::fs::remove_file(&result_path);
-    if !output.status.success() && result.is_err() {
-        return Err(AppError::msg(
-            "ZeroTier: запрос прав администратора отклонён или служба не перезапущена",
-        ));
-    }
     result
 }
 
@@ -810,18 +840,13 @@ printf 'OK\n' > "$result"
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700));
     }
-    let status = std::process::Command::new("pkexec")
+    std::process::Command::new("pkexec")
         .arg("/bin/sh")
         .arg(&script_path)
         .status()?;
     let result = read_script_result(&result_path);
     let _ = std::fs::remove_file(&script_path);
     let _ = std::fs::remove_file(&result_path);
-    if !status.success() && result.is_err() {
-        return Err(AppError::msg(
-            "ZeroTier: запрос прав root отклонён или служба не перезапущена",
-        ));
-    }
     result
 }
 
