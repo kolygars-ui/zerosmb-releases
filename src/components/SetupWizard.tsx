@@ -77,6 +77,10 @@ export default function SetupWizard({ onDone }: Props) {
     void api.getPlanet(ztMode).then(setPlanetInfo).catch(() => undefined);
   }, [ztMode]);
 
+  useEffect(() => {
+    if (isAndroid && ztMode === "system") setNetworkId("");
+  }, [isAndroid, ztMode]);
+
   const updateSmb = <K extends keyof SmbConfig>(key: K, value: SmbConfig[K]) => {
     setSmb((current) => ({ ...current, [key]: value }));
   };
@@ -379,6 +383,24 @@ export default function SetupWizard({ onDone }: Props) {
                 <span className="mono">sudo snap install zerotier</span>.
               </div>
             )}
+            {isAndroid && ztMode === "system" ? (
+              <div className="row">
+                <button
+                  className="btn primary"
+                  onClick={() => void api.ztOpenAndroid("")}
+                >
+                  Открыть приложение ZeroTier
+                </button>
+                <span className="spacer" />
+                <button className="btn ghost" onClick={() => setStep(0)}>
+                  Назад
+                </button>
+                <button className="btn" onClick={() => setStep(2)}>
+                  Далее
+                </button>
+              </div>
+            ) : (
+              <>
             <div className="row">
               <button className="btn ghost" onClick={() => void api.ztOpenHelp()}>
                 {isAndroid ? "Открыть приложение ZeroTier" : "Скачать ZeroTier"}
@@ -494,6 +516,8 @@ export default function SetupWizard({ onDone }: Props) {
               <div className="hint">
                 ZeroTier One не найден. Установите его по ссылке выше и запустите службу.
               </div>
+            )}
+              </>
             )}
           </div>
         )}

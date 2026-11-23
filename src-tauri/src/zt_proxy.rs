@@ -72,9 +72,6 @@ pub async fn effective_smb_config_with_provider(
             local.port = port;
             return Ok(local);
         }
-        "zerotier" if network_id.trim().is_empty() => {
-            return Err(AppError::msg("Укажите ZeroTier Network ID"));
-        }
         "zerotier" => {
             if zerotier_mode == "system" {
                 log::info!(
@@ -83,6 +80,9 @@ pub async fn effective_smb_config_with_provider(
                     cfg.port
                 );
                 return Ok(cfg.clone());
+            }
+            if network_id.trim().is_empty() {
+                return Err(AppError::msg("Укажите ZeroTier Network ID"));
             }
         }
         _ => {

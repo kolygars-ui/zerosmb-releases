@@ -177,6 +177,10 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
     void api.getPlanet(ztMode).then(setPlanetInfo).catch(() => undefined);
   }, [ztMode]);
 
+  useEffect(() => {
+    if (android && ztMode === "system") setNetworkId("");
+  }, [android, ztMode]);
+
   const updateSmb = <K extends keyof SmbConfig>(key: K, value: SmbConfig[K]) => {
     setSmb((current) => ({ ...current, [key]: value }));
   };
@@ -1173,6 +1177,14 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
                 Поддерживается установка через apt (`zerotier-one`) и snap (`zerotier`).
               </div>
             )}
+            {android && ztMode === "system" ? (
+              <div className="row" style={{ marginTop: 12 }}>
+                <button className="btn primary" onClick={() => void api.ztOpenAndroid("")}>
+                  Открыть приложение ZeroTier
+                </button>
+              </div>
+            ) : (
+              <>
             <div className="row" style={{ marginTop: 10 }}>
               <button className="btn ghost" onClick={() => void api.ztOpenHelp()}>
                 {android ? "Открыть приложение ZeroTier" : "Скачать ZeroTier"}
@@ -1339,6 +1351,8 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
               <div className="hint" style={{ marginTop: 10 }}>
                 {zt?.message || "Нет данных о сетях"}
               </div>
+            )}
+              </>
             )}
           </div>
         )}
