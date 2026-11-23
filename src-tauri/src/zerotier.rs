@@ -387,6 +387,13 @@ pub async fn status() -> ZtStatus {
             messages.join("; ")
         };
     }
+    log::info!(
+        "ZeroTier system status: available={} online={} networks={} message={}",
+        status.available,
+        status.service_online,
+        status.networks.len(),
+        status.message
+    );
     status
 }
 
@@ -396,6 +403,7 @@ pub async fn join(network_id: &str) -> AppResult<ZtStatus> {
     if network_id.is_empty() {
         return Err(AppError::msg("Укажите ZeroTier Network ID"));
     }
+    log::info!("ZeroTier system: join {network_id}");
     if let Some(token) = read_token() {
         zt_http("POST", &format!("/network/{network_id}"), &token, Some("{}")).await?;
         let mut last = ZtStatus::default();
@@ -436,6 +444,7 @@ pub async fn leave(network_id: &str) -> AppResult<ZtStatus> {
     if network_id.is_empty() {
         return Err(AppError::msg("Укажите ZeroTier Network ID"));
     }
+    log::info!("ZeroTier system: leave {network_id}");
     if let Some(token) = read_token() {
         zt_http(
             "DELETE",
@@ -614,12 +623,12 @@ const DEFAULT_PLANET_WORLD_ID: u64 = 149604618;
 #[cfg(not(target_os = "android"))]
 fn planet_world_id(path: &std::path::Path) -> Option<u64> {
     let data = std::fs::read(path).ok()?;
-    if data.len() < 12 {
+    if data.len() < 9 {
         return None;
     }
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&data[4..12]);
-    Some(u64::from_be_bytes(bytes))
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&data[5..9]);
+    Some(u32::from_be_bytes(bytes) as u64)
 }
 
 #[cfg(not(target_os = "android"))]
@@ -719,16 +728,24 @@ try {
     std::fs::write(&script_path, script)?;
 
     let escaped = script_path.display().to_string().replace('\'', "''");
+    let result_escaped = result_path.display().to_string().replace('\'', "''");
     let command = format!(
-        "$p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','{escaped}') -Verb RunAs -Wait -PassThru; exit $p.ExitCode"
+        "$ErrorActionPreference = 'Stop'; try {{ $p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','{escaped}') -Verb RunAs -Wait -PassThru -ErrorAction Stop; exit $p.ExitCode }} catch {{ Set-Content -LiteralPath '{result_escaped}' -Value $_.Exception.Message -Encoding UTF8; exit 1 }}"
     );
-    let status = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &command])
-        .status()?;
+    log::info!("ZeroTier planet: requesting administrator rights");
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &command])
+        .output()?;
+    log::info!(
+        "ZeroTier planet: elevation finished status={:?} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     let result = read_script_result(&result_path);
     let _ = std::fs::remove_file(&script_path);
     let _ = std::fs::remove_file(&result_path);
-    if !status.success() && result.is_err() {
+    if !output.status.success() && result.is_err() {
         return Err(AppError::msg(
             "ZeroTier: запрос прав администратора отклонён или служба не перезапущена",
         ));

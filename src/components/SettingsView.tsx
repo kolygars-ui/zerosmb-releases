@@ -1196,7 +1196,7 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
                     <h3 style={{ marginBottom: 2 }}>Корневые серверы ZeroTier (planet)</h3>
                     <span className="small muted">
                       {ztMode === "system"
-                        ? "Свой planet для системного ZeroTier. Установка требует прав администратора."
+                        ? "Свой planet для системного ZeroTier. Windows запросит UAC, Linux — pkexec."
                         : "Свой planet для встроенного ZeroTier."}
                     </span>
                   </div>

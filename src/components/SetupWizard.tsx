@@ -455,7 +455,7 @@ export default function SetupWizard({ onDone }: Props) {
                 </div>
                 <span className="hint">
                   {ztMode === "system"
-                    ? "planet будет установлен в системный ZeroTier One (потребуются права администратора) и применится после перезапуска службы."
+                    ? "planet будет установлен в системный ZeroTier One. Windows запросит UAC, Linux — pkexec; после этого служба перезапустится."
                     : "Необязательно. Свой planet заменяет корневые серверы ZeroTier и применяется после переподключения сети."}
                 </span>
               </div>
