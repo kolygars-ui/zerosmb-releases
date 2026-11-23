@@ -1,4 +1,4 @@
-﻿use crate::android_bridge;
+use crate::android_bridge;
 use crate::android_progress;
 use crate::config::{self, AppConfig, SmbConfig, SyncJob, SyncSource};
 use crate::error::{AppError, AppResult};
@@ -6,6 +6,8 @@ use crate::smb_service::{file_kind, join_rel, normalize_rel, FileEntry, SmbServi
 use crate::state::AppState;
 use crate::sync::{self, SyncProgress, SyncSummary};
 use crate::zerotier::{self, ZtStatus};
+#[cfg(target_os = "android")]
+use crate::zerotier::ZtNetwork;
 use crate::zt_proxy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,8 +30,10 @@ pub struct PublicConfig {
     pub setup_complete: bool,
     pub zerotier_network_id: String,
     pub connection_mode: String,
+    pub zerotier_mode: String,
     pub smb: SmbConfig,
     pub sync_jobs: Vec<SyncJob>,
+    pub gallery_share: String,
     pub remote_gallery_path: String,
     pub suggested_gallery_path: String,
     pub gallery_enabled: bool,
@@ -43,6 +47,7 @@ pub struct PublicConfig {
     pub external_save_enabled: bool,
     pub external_save_mode: String,
     pub download_dir: String,
+    pub diagnostics_path: String,
     pub download_auto_save: bool,
     pub download_keep_structure: bool,
     pub system_install_dir: String,
@@ -79,6 +84,7 @@ pub struct PublicConfig {
 pub struct SetupInput {
     pub zerotier_network_id: String,
     pub connection_mode: Option<String>,
+    pub zerotier_mode: Option<String>,
     pub smb: SmbConfig,
     pub password: String,
     pub remote_gallery_path: Option<String>,
@@ -102,6 +108,7 @@ pub struct SetupInput {
 pub struct SettingsInput {
     pub smb: SmbConfig,
     pub password: Option<String>,
+    pub gallery_share: Option<String>,
     pub remote_gallery_path: Option<String>,
     pub gallery_enabled: Option<bool>,
     pub gallery_columns: Option<u8>,
@@ -114,6 +121,7 @@ pub struct SettingsInput {
     pub external_save_enabled: Option<bool>,
     pub external_save_mode: Option<String>,
     pub download_dir: Option<String>,
+    pub diagnostics_path: Option<String>,
     pub download_auto_save: Option<bool>,
     pub download_keep_structure: Option<bool>,
     pub system_install_dir: Option<String>,
@@ -130,6 +138,7 @@ pub struct SettingsInput {
     pub wireguard_enabled: Option<bool>,
     pub zerotier_network_id: Option<String>,
     pub connection_mode: Option<String>,
+    pub zerotier_mode: Option<String>,
     pub ai_enabled: Option<bool>,
     pub ai_allow_download: Option<bool>,
     pub ai_allow_modify: Option<bool>,
@@ -153,6 +162,12 @@ pub struct PlanetInfo {
     pub configured: bool,
     pub custom_roots: bool,
     pub size: u64,
+    pub system_configured: bool,
+    pub system_supported: bool,
+    pub system_managed: bool,
+    pub system_size: u64,
+    pub system_world_id: Option<u64>,
+    pub system_location: Option<String>,
     pub message: String,
 }
 
@@ -207,7 +222,7 @@ async fn embedded_desktop_ensure(
     .await
     .map_err(|error| AppError::msg(error.to_string()))?
 }
-fn planet_info(state: &AppState) -> PlanetInfo {
+fn planet_info(state: &AppState, zerotier_mode: &str) -> PlanetInfo {
     let path = state.planet_file().ok();
     let size = path
         .as_ref()
@@ -215,11 +230,46 @@ fn planet_info(state: &AppState) -> PlanetInfo {
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     let configured = path.as_ref().map(|path| path.is_file()).unwrap_or(false);
+    #[cfg(not(target_os = "android"))]
+    let (system_configured, system_supported, system_managed, system_size, system_world_id, system_location) = (
+        zerotier::system_planet_configured(),
+        true,
+        zerotier::system_planet_managed(),
+        zerotier::system_planet_size(),
+        zerotier::system_planet_world_id(),
+        zerotier::system_planet_location(),
+    );
+    #[cfg(target_os = "android")]
+    let (
+        system_configured,
+        system_supported,
+        system_managed,
+        system_size,
+        system_world_id,
+        system_location,
+    ) = (false, false, false, 0, None, None);
+    let system_mode = zerotier_mode == "system";
     PlanetInfo {
         configured,
         custom_roots: state.config().custom_roots,
         size,
-        message: if configured {
+        system_configured,
+        system_supported,
+        system_managed,
+        system_size,
+        system_world_id,
+        system_location,
+        message: if system_mode {
+            if !system_supported {
+                "На Android системный planet устанавливается в приложении ZeroTier One".to_string()
+            } else if system_configured && system_managed {
+                "Свой planet установлен через ZeroSMB".to_string()
+            } else if system_configured {
+                "Свой planet уже установлен вручную".to_string()
+            } else {
+                "Используются стандартные корни системного ZeroTier".to_string()
+            }
+        } else if configured {
             "Свой planet установлен; встроенные корни отключены".to_string()
         } else {
             "Используются встроенные корни ZeroTier".to_string()
@@ -232,12 +282,15 @@ fn public_config(state: &AppState) -> PublicConfig {
     let suggested_gallery_path = config::suggested_gallery_path(&cfg.smb);
     let installed = system_installed(&cfg);
     let connection_mode = cfg.resolved_connection_mode().to_string();
+    let zerotier_mode = cfg.resolved_zerotier_mode().to_string();
     PublicConfig {
         setup_complete: cfg.setup_complete,
         zerotier_network_id: cfg.zerotier_network_id,
         connection_mode,
+        zerotier_mode,
         smb: cfg.smb,
         sync_jobs: cfg.sync_jobs,
+        gallery_share: cfg.gallery_share,
         remote_gallery_path: cfg.remote_gallery_path,
         suggested_gallery_path,
         gallery_enabled: cfg.gallery_enabled,
@@ -251,6 +304,7 @@ fn public_config(state: &AppState) -> PublicConfig {
         external_save_enabled: cfg.external_save_enabled,
         external_save_mode: cfg.external_save_mode,
         download_dir: cfg.download_dir,
+        diagnostics_path: cfg.diagnostics_path,
         download_auto_save: cfg.download_auto_save,
         download_keep_structure: cfg.download_keep_structure,
         system_install_dir: cfg.system_install_dir.clone(),
@@ -294,6 +348,40 @@ fn system_installed(cfg: &AppConfig) -> bool {
         return false;
     };
     parent == std::path::Path::new(cfg.system_install_dir.trim())
+}
+
+fn zerotier_mode_for(state: &AppState, requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(config::normalize_zerotier_mode)
+        .unwrap_or_else(|| state.config().resolved_zerotier_mode())
+}
+
+fn uses_embedded_zerotier(cfg: &AppConfig) -> bool {
+    cfg.resolved_connection_mode() == "zerotier" && cfg.resolved_zerotier_mode() == "embedded"
+}
+
+#[cfg(target_os = "android")]
+fn android_system_status(network_id: &str) -> ZtStatus {
+    let network_id = network_id.trim();
+    let networks = if network_id.is_empty() {
+        Vec::new()
+    } else {
+        vec![ZtNetwork {
+            id: network_id.to_string(),
+            name: "ZeroTier (приложение)".to_string(),
+            status: "APP".to_string(),
+            assigned_addresses: Vec::new(),
+        }]
+    };
+    ZtStatus {
+        available: true,
+        service_online: false,
+        version: None,
+        address: None,
+        networks,
+        message: "Системный ZeroTier на Android управляется отдельным приложением ZeroTier One. Откройте его, добавьте сеть и авторизуйте устройство в ZeroTier Central.".to_string(),
+        android: true,
+    }
 }
 
 #[tauri::command]
@@ -372,6 +460,7 @@ pub async fn test_connection(
     password: String,
     zerotier_network_id: Option<String>,
     connection_mode: Option<String>,
+    zerotier_mode: Option<String>,
 ) -> AppResult<()> {
     let network_id = zerotier_network_id.as_deref().unwrap_or("");
     let state = app.state::<AppState>();
@@ -379,8 +468,10 @@ pub async fn test_connection(
         .as_deref()
         .and_then(config::normalize_connection_mode)
         .unwrap_or_else(|| state.config().resolved_connection_mode());
+    let provider = zerotier_mode_for(&state, zerotier_mode.as_deref());
     let effective =
-        zt_proxy::effective_smb_config_for(&app, &smb, mode, network_id).await?;
+        zt_proxy::effective_smb_config_with_provider(&app, &smb, mode, network_id, provider)
+            .await?;
     if mode == "local" {
         probe_tcp(&smb).await?;
     }
@@ -392,6 +483,7 @@ pub async fn test_current_connection(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
+    let _guard = state.inner.smb_lock.lock().await;
     let cfg = state.config();
     let mode = cfg.resolved_connection_mode();
     let effective =
@@ -410,6 +502,7 @@ pub async fn test_connection_saved(
     smb: SmbConfig,
     zerotier_network_id: Option<String>,
     connection_mode: Option<String>,
+    zerotier_mode: Option<String>,
 ) -> AppResult<()> {
     let network_id = match zerotier_network_id.as_ref() {
         Some(value) => value.trim().to_string(),
@@ -419,8 +512,10 @@ pub async fn test_connection_saved(
         .as_deref()
         .and_then(config::normalize_connection_mode)
         .unwrap_or_else(|| state.config().resolved_connection_mode());
+    let provider = zerotier_mode_for(&state, zerotier_mode.as_deref());
     let effective =
-        zt_proxy::effective_smb_config_for(&app, &smb, mode, &network_id).await?;
+        zt_proxy::effective_smb_config_with_provider(&app, &smb, mode, &network_id, provider)
+            .await?;
     if mode == "local" {
         probe_tcp(&smb).await?;
     }
@@ -428,15 +523,24 @@ pub async fn test_connection_saved(
 }
 
 #[tauri::command]
-pub fn get_planet(state: State<'_, AppState>) -> PlanetInfo {
-    planet_info(&state)
+pub fn get_planet(state: State<'_, AppState>, zerotier_mode: Option<String>) -> PlanetInfo {
+    let provider = zerotier_mode_for(&state, zerotier_mode.as_deref());
+    planet_info(&state, provider)
 }
 
 #[tauri::command]
 pub async fn pick_planet(
     app: AppHandle,
     state: State<'_, AppState>,
+    zerotier_mode: Option<String>,
 ) -> AppResult<PlanetInfo> {
+    let provider = zerotier_mode_for(&state, zerotier_mode.as_deref());
+    #[cfg(target_os = "android")]
+    if provider == "system" {
+        return Err(AppError::msg(
+            "На Android planet устанавливается в приложении ZeroTier One",
+        ));
+    }
     let data: Vec<u8>;
 
     #[cfg(not(target_os = "android"))]
@@ -484,6 +588,10 @@ pub async fn pick_planet(
     let destination = state.planet_file()?;
     std::fs::write(&destination, &data)?;
     state.update_config(|cfg| cfg.custom_roots = true)?;
+    #[cfg(not(target_os = "android"))]
+    if provider == "system" {
+        zerotier::install_planet(destination.clone()).await?;
+    }
     #[cfg(target_os = "android")]
     {
         let _: Value = android_bridge::call(&app, "ztStop", serde_json::json!({})).await?;
@@ -493,14 +601,20 @@ pub async fn pick_planet(
         let _ = &app;
         state.inner.zt.stop();
     }
-    Ok(planet_info(&state))
+    Ok(planet_info(&state, provider))
 }
 
 #[tauri::command]
 pub async fn clear_planet(
     app: AppHandle,
     state: State<'_, AppState>,
+    zerotier_mode: Option<String>,
 ) -> AppResult<PlanetInfo> {
+    let provider = zerotier_mode_for(&state, zerotier_mode.as_deref());
+    #[cfg(not(target_os = "android"))]
+    if provider == "system" {
+        zerotier::remove_planet().await?;
+    }
     let path = state.planet_file()?;
     let _ = std::fs::remove_file(path);
     state.update_config(|cfg| cfg.custom_roots = false)?;
@@ -513,7 +627,7 @@ pub async fn clear_planet(
         let _ = &app;
         state.inner.zt.stop();
     }
-    let mut info = planet_info(&state);
+    let mut info = planet_info(&state, provider);
     info.message =
         "Свой planet удалён. Перезапустите приложение, чтобы вернуть встроенные корни."
             .to_string();
@@ -525,6 +639,7 @@ pub async fn save_setup(
     state: State<'_, AppState>,
     input: SetupInput,
 ) -> AppResult<PublicConfig> {
+    let _guard = state.inner.smb_lock.lock().await;
     let network = input.zerotier_network_id.trim().to_string();
     let mode = input
         .connection_mode
@@ -548,6 +663,15 @@ pub async fn save_setup(
     cfg.setup_complete = true;
     cfg.zerotier_network_id = network;
     cfg.connection_mode = mode.clone();
+    if let Some(value) = input
+        .zerotier_mode
+        .as_deref()
+        .and_then(config::normalize_zerotier_mode)
+    {
+        cfg.zerotier_mode = value.to_string();
+    } else if cfg.zerotier_mode.trim().is_empty() {
+        cfg.zerotier_mode = cfg.resolved_zerotier_mode().to_string();
+    }
     cfg.smb = input.smb;
     cfg.remote_gallery_path = input
         .remote_gallery_path
@@ -602,7 +726,7 @@ pub async fn save_setup(
     if mode != "wireguard" {
         state.inner.wireguard.stop().await;
     }
-    if mode != "zerotier" {
+    if !uses_embedded_zerotier(&state.config()) {
         #[cfg(target_os = "android")]
         {
             let _: Value = android_bridge::call(&app, "ztStop", serde_json::json!({})).await?;
@@ -631,8 +755,8 @@ pub async fn save_settings(
     state: State<'_, AppState>,
     input: SettingsInput,
 ) -> AppResult<PublicConfig> {
+    let _guard = state.inner.smb_lock.lock().await;
     input.smb.validate()?;
-    let old_smb = state.config().smb;
     let password = input
         .password
         .as_ref()
@@ -640,10 +764,6 @@ pub async fn save_settings(
         .filter(|value| !value.is_empty());
 
     let dir = state.data_dir()?;
-    if old_smb.account() != input.smb.account() && password.is_none() {
-        config::clear_password(&dir, &old_smb);
-        state.set_password(None);
-    }
     if let Some(password) = password {
         config::save_password(&dir, &input.smb, &password)?;
         state.set_password(Some(password));
@@ -651,12 +771,28 @@ pub async fn save_settings(
 
     let mut cfg = state.config();
     cfg.smb = input.smb;
+    if let Some(share) = input.gallery_share {
+        cfg.gallery_share = share
+            .trim()
+            .trim_matches(|ch| ch == '/' || ch == '\\')
+            .to_string();
+    }
     if let Some(path) = input.remote_gallery_path {
-        let path = path.trim();
+        let mut path = path.trim().replace('\\', "/");
+        let share = cfg.gallery_share.trim();
+        if !share.is_empty() {
+            let prefix = format!("{share}/");
+            if path
+                .to_ascii_lowercase()
+                .starts_with(&prefix.to_ascii_lowercase())
+            {
+                path = path[prefix.len()..].to_string();
+            }
+        }
         cfg.remote_gallery_path = if path.is_empty() {
             config::suggested_gallery_path(&cfg.smb)
         } else {
-            path.to_string()
+            path.trim_matches('/').to_string()
         };
     }
     if let Some(enabled) = input.gallery_enabled {
@@ -695,6 +831,14 @@ pub async fn save_settings(
     }
     if let Some(dir) = input.download_dir {
         cfg.download_dir = dir.trim().to_string();
+    }
+    if let Some(path) = input.diagnostics_path {
+        let path = path.trim().replace('\\', "/");
+        cfg.diagnostics_path = if path.is_empty() {
+            "Diagnostics".to_string()
+        } else {
+            path
+        };
     }
     if let Some(auto) = input.download_auto_save {
         cfg.download_auto_save = auto;
@@ -745,6 +889,14 @@ pub async fn save_settings(
         if let Some(mode) = config::normalize_connection_mode(&mode) {
             cfg.connection_mode = mode.to_string();
         }
+    }
+    if let Some(mode) = input.zerotier_mode {
+        if let Some(mode) = config::normalize_zerotier_mode(&mode) {
+            cfg.zerotier_mode = mode.to_string();
+        }
+    }
+    if cfg.zerotier_mode.trim().is_empty() {
+        cfg.zerotier_mode = cfg.resolved_zerotier_mode().to_string();
     }
     if let Some(value) = input.ai_enabled {
         cfg.ai_enabled = value;
@@ -801,7 +953,7 @@ pub async fn save_settings(
     if mode != "wireguard" {
         state.inner.wireguard.stop().await;
     }
-    if mode != "zerotier" {
+    if !uses_embedded_zerotier(&state.config()) {
         #[cfg(target_os = "android")]
         {
             let _: Value =
@@ -844,31 +996,95 @@ pub async fn pick_local_folder(app: AppHandle) -> AppResult<Option<String>> {
     }
 }
 
+fn resolve_share_path(cfg: &SmbConfig, path: &str) -> AppResult<(SmbConfig, String, Option<String>)> {
+    let mut cfg = cfg.clone();
+    if !cfg.share.trim().is_empty() {
+        let relative = if path.trim().is_empty() {
+            cfg.normalized_base()
+        } else {
+            normalize_rel(path)
+        };
+        return Ok((cfg, relative, None));
+    }
+    let relative = normalize_rel(path);
+    if relative.is_empty() {
+        return Ok((cfg, relative, None));
+    }
+    let (share, rest) = relative.split_once('/').unwrap_or((relative.as_str(), ""));
+    if share.trim().is_empty() {
+        return Err(AppError::msg("Не указан SMB-ресурс"));
+    }
+    cfg.share = share.to_string();
+    cfg.base_path.clear();
+    Ok((cfg, rest.to_string(), Some(share.to_string())))
+}
+
+pub(crate) fn resolve_remote_path(
+    cfg: &AppConfig,
+    path: &str,
+) -> AppResult<(SmbConfig, String, Option<String>)> {
+    let gallery = cfg.gallery_share.trim();
+    if !gallery.is_empty() {
+        let normalized = normalize_rel(path);
+        let (head, rest) = normalized
+            .split_once('/')
+            .unwrap_or((normalized.as_str(), ""));
+        if head.eq_ignore_ascii_case(gallery) {
+            let mut smb = cfg.smb.clone();
+            smb.share = gallery.to_string();
+            smb.base_path.clear();
+            return Ok((smb, rest.to_string(), Some(gallery.to_string())));
+        }
+    }
+    resolve_share_path(&cfg.smb, path)
+}
+
+fn prefix_share_path(entries: &mut [FileEntry], share: &str) {
+    for entry in entries {
+        entry.path = format!("{share}/{}", entry.path);
+    }
+}
+
 #[tauri::command]
 pub async fn smb_list(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
 ) -> AppResult<Vec<FileEntry>> {
-    let cfg = state.config();
+    let _guard = state.inner.smb_lock.lock().await;
+    let full_cfg = state.config();
     let password = state.password()?;
-    let relative = if path.trim().is_empty() {
-        cfg.smb.normalized_base()
-    } else {
-        normalize_rel(&path)
-    };
     let operation = async {
+        if full_cfg.smb.share.trim().is_empty() && path.trim().is_empty() {
+            let effective = zt_proxy::effective_smb_config(
+                &app,
+                &full_cfg.smb,
+                &full_cfg.zerotier_network_id,
+            )
+            .await?;
+            return SmbService::list_shares(
+                &effective,
+                &full_cfg.smb.normalized_host(),
+                &password,
+            )
+            .await;
+        }
+        let (cfg, relative, share_prefix) = resolve_remote_path(&full_cfg, &path)?;
         let effective =
-            zt_proxy::effective_smb_config(&app, &cfg.smb, &cfg.zerotier_network_id).await?;
+            zt_proxy::effective_smb_config(&app, &cfg, &full_cfg.zerotier_network_id).await?;
         let client = state.inner.smb.connect(&effective, &password).await?;
-        match state.inner.smb.list_dir(&client, "", &relative).await {
-            Ok(entries) => Ok(entries),
+        let mut entries = match state.inner.smb.list_dir(&client, "", &relative).await {
+            Ok(entries) => entries,
             Err(_) => {
                 state.inner.smb.reset().await;
                 let client = state.inner.smb.connect(&effective, &password).await?;
-                state.inner.smb.list_dir(&client, "", &relative).await
+                state.inner.smb.list_dir(&client, "", &relative).await?
             }
+        };
+        if let Some(share) = share_prefix {
+            prefix_share_path(&mut entries, &share);
         }
+        Ok(entries)
     };
     match tokio::time::timeout(std::time::Duration::from_secs(30), operation).await {
         Ok(result) => result,
@@ -882,11 +1098,127 @@ pub async fn smb_list(
 }
 
 #[tauri::command]
+pub async fn select_smb_share(
+    state: State<'_, AppState>,
+    share: String,
+) -> AppResult<PublicConfig> {
+    let share = share.trim().to_string();
+    if share.is_empty() {
+        return Err(AppError::msg("Не указан SMB-ресурс"));
+    }
+    let _guard = state.inner.smb_lock.lock().await;
+    let mut cfg = state.config();
+    cfg.smb.share = share;
+    state.set_config(cfg)?;
+    state.inner.smb.reset().await;
+    state.inner.media_smb.reset().await;
+    Ok(public_config(&state))
+}
+
+#[tauri::command]
+pub async fn clear_smb_share(state: State<'_, AppState>) -> AppResult<PublicConfig> {
+    let _guard = state.inner.smb_lock.lock().await;
+    let mut cfg = state.config();
+    cfg.smb.share.clear();
+    state.set_config(cfg)?;
+    state.inner.smb.reset().await;
+    state.inner.media_smb.reset().await;
+    Ok(public_config(&state))
+}
+
+#[tauri::command]
+pub async fn send_error_log(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    remote_dir: String,
+) -> AppResult<String> {
+    if remote_dir.trim().is_empty() {
+        return Err(AppError::msg("Укажите папку на NAS для файла ошибок"));
+    }
+    let _guard = state.inner.smb_lock.lock().await;
+    let app_cfg = state.config();
+    let password = state.password()?;
+    let (cfg, relative, _) = resolve_share_path(&app_cfg.smb, &remote_dir)?;
+    let effective =
+        zt_proxy::effective_smb_config(&app, &cfg, &app_cfg.zerotier_network_id).await?;
+    let client = state.inner.smb.connect(&effective, &password).await?;
+    let report = build_error_report(&app_cfg);
+    let stamp = time::OffsetDateTime::now_utc().unix_timestamp();
+    let file_name = format!("zerosmb-errors-{stamp}.log");
+    let remote = if relative.is_empty() {
+        file_name.clone()
+    } else {
+        format!("{relative}/{file_name}")
+    };
+    let temp_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| AppError::msg(error.to_string()))?
+        .join("diagnostics");
+    tokio::fs::create_dir_all(&temp_dir).await?;
+    let temp = temp_dir.join(format!("{}-{file_name}", uuid::Uuid::new_v4()));
+    tokio::fs::write(&temp, report.as_bytes()).await?;
+    let uploaded = state.inner.smb.upload_file(&client, &remote, &temp).await;
+    let _ = tokio::fs::remove_file(&temp).await;
+    let bytes = uploaded?;
+    Ok(format!("Файл ошибок отправлен: {remote} ({bytes} байт)"))
+}
+
+fn build_error_report(cfg: &AppConfig) -> String {
+    use std::fmt::Write as _;
+
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+    let mut report = String::new();
+    let _ = writeln!(report, "ZeroSMB error report");
+    let _ = writeln!(report, "Generated (unix): {timestamp}");
+    let _ = writeln!(report, "Version: {}", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(
+        report,
+        "Platform: {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    let _ = writeln!(
+        report,
+        "Connection: {}",
+        cfg.resolved_connection_mode()
+    );
+    let _ = writeln!(report, "SMB host: {}", cfg.smb.normalized_host());
+    let _ = writeln!(report, "SMB share: {}", cfg.smb.share.trim());
+    let _ = writeln!(report, "Gallery share: {}", cfg.gallery_share.trim());
+    let _ = writeln!(report, "SMB user: {}", cfg.smb.auth_user());
+    for (label, file_name) in [
+        ("Panic log", "zerosmb-crash.log"),
+        ("Native crash log", "zerosmb-native-crash.log"),
+        ("Runtime log", "zerosmb.log"),
+    ] {
+        let path = std::env::temp_dir().join(file_name);
+        let data = std::fs::read(&path).unwrap_or_default();
+        let data = if data.len() > 256 * 1024 {
+            String::from_utf8_lossy(&data[data.len() - 256 * 1024..]).to_string()
+        } else {
+            String::from_utf8_lossy(&data).to_string()
+        };
+        let _ = writeln!(report, "{label}: {}", path.display());
+        if data.trim().is_empty() {
+            let _ = writeln!(report, "(пусто)");
+        } else {
+            report.push_str(&data);
+            if !data.ends_with('\n') {
+                report.push('\n');
+            }
+        }
+    }
+    report
+}
+
+#[tauri::command]
 pub async fn ensure_gallery_folder(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
 ) -> AppResult<bool> {
+    let _guard = state.inner.smb_lock.lock().await;
     let cfg = state.config();
     let password = state.password()?;
     let effective =
@@ -1224,10 +1556,16 @@ pub async fn sync_run_job(
 pub async fn zt_status(
     app: AppHandle,
     state: State<'_, AppState>,
+    zerotier_mode: Option<String>,
 ) -> AppResult<ZtStatus> {
-    let network_id = state.config().zerotier_network_id;
+    let config = state.config();
+    let network_id = config.zerotier_network_id;
+    let provider = zerotier_mode_for(&state, zerotier_mode.as_deref());
     #[cfg(target_os = "android")]
     {
+        if provider == "system" {
+            return Ok(android_system_status(&network_id));
+        }
         let planet = state
             .planet_path()?
             .map(|path| path.to_string_lossy().to_string());
@@ -1241,6 +1579,9 @@ pub async fn zt_status(
     #[cfg(not(target_os = "android"))]
     {
         let _ = app;
+        if provider == "system" {
+            return Ok(zerotier::status().await);
+        }
         if network_id.trim().is_empty() {
             let mut status = ZtStatus::default();
             status.message = "Сначала укажите Network ID ZeroTier".to_string();
@@ -1255,9 +1596,20 @@ pub async fn zt_join(
     app: AppHandle,
     state: State<'_, AppState>,
     network_id: String,
+    zerotier_mode: Option<String>,
 ) -> AppResult<ZtStatus> {
+    let provider = zerotier_mode_for(&state, zerotier_mode.as_deref());
     #[cfg(target_os = "android")]
     {
+        if provider == "system" {
+            let _: Value = android_bridge::call(
+                &app,
+                "openZeroTier",
+                serde_json::json!({ "networkId": network_id }),
+            )
+            .await?;
+            return Ok(android_system_status(&network_id));
+        }
         let planet = state
             .planet_path()?
             .map(|path| path.to_string_lossy().to_string());
@@ -1266,6 +1618,9 @@ pub async fn zt_join(
     #[cfg(not(target_os = "android"))]
     {
         let _ = app;
+        if provider == "system" {
+            return zerotier::join(&network_id).await;
+        }
         embedded_desktop_ensure(&state, &network_id, false).await
     }
 }
@@ -1275,15 +1630,30 @@ pub async fn zt_leave(
     app: AppHandle,
     state: State<'_, AppState>,
     network_id: String,
+    zerotier_mode: Option<String>,
 ) -> AppResult<ZtStatus> {
+    let provider = zerotier_mode_for(&state, zerotier_mode.as_deref());
     #[cfg(target_os = "android")]
     {
-        let _ = (state, network_id);
+        if provider == "system" {
+            let _: Value = android_bridge::call(
+                &app,
+                "openZeroTier",
+                serde_json::json!({ "networkId": network_id }),
+            )
+            .await?;
+            return Err(AppError::msg(
+                "На Android сеть ZeroTier отключается в приложении ZeroTier One",
+            ));
+        }
         zerotier::embedded_leave(&app).await
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (app, network_id);
+        let _ = app;
+        if provider == "system" {
+            return zerotier::leave(&network_id).await;
+        }
         let zt = state.inner.zt.clone();
         tokio::task::spawn_blocking(move || zt.leave())
             .await
@@ -1334,6 +1704,8 @@ pub struct UploadResult {
 struct PickedFile {
     path: String,
     name: String,
+    #[serde(default)]
+    relative_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1358,13 +1730,227 @@ fn remote_file_name(name: &str) -> String {
     }
 }
 
+struct UploadItem {
+    source: PathBuf,
+    remote: String,
+}
+
+fn upload_remote_rel(path: &str) -> String {
+    path.split(['/', '\\'])
+        .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+        .map(remote_file_name)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn folder_upload_items(folder: &PathBuf) -> Vec<UploadItem> {
+    let base = folder
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("folder");
+    let base = remote_file_name(base);
+    let mut items = Vec::new();
+    for entry in walkdir::WalkDir::new(folder).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(folder)
+            .unwrap_or(entry.path())
+            .to_string_lossy();
+        let relative = upload_remote_rel(&relative);
+        if relative.is_empty() {
+            continue;
+        }
+        items.push(UploadItem {
+            source: entry.path().to_path_buf(),
+            remote: format!("{base}/{relative}"),
+        });
+    }
+    items
+}
+
+async fn upload_items(
+    app: &AppHandle,
+    state: &AppState,
+    remote_dir: &str,
+    items: Vec<UploadItem>,
+    media_only: bool,
+    on_progress: Channel<SyncProgress>,
+) -> AppResult<UploadResult> {
+    if media_only {
+        let invalid = items
+            .iter()
+            .filter(|item| {
+                let name = item.source.to_string_lossy();
+                !matches!(file_kind(&name), "image" | "gif" | "video")
+            })
+            .map(|item| item.source.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        if !invalid.is_empty() {
+            return Err(AppError::msg(format!(
+                "Можно загружать только фото и видео. Неподходящие файлы: {}",
+                invalid.chunks(5).next().unwrap_or(&[]).join(", ")
+            )));
+        }
+    }
+    if items.is_empty() {
+        return Err(AppError::msg("Файлы не выбраны"));
+    }
+    let _guard = state.inner.smb_lock.lock().await;
+
+    let total = items.len();
+    let _ = on_progress.send(SyncProgress {
+        phase: "start".to_string(),
+        current: 0,
+        total,
+        file: String::new(),
+        bytes: 0,
+        skipped: 0,
+        failed: 0,
+        message: None,
+    });
+    android_progress::update(
+        app,
+        "Загрузка на NAS",
+        &format!("Файлов: {total}"),
+        0,
+        total,
+        false,
+    )
+    .await;
+
+    let app_cfg = state.config();
+    let password = state.password()?;
+    let (cfg, dir, _) = resolve_remote_path(&app_cfg, remote_dir)?;
+    let effective =
+        zt_proxy::effective_smb_config(app, &cfg, &app_cfg.zerotier_network_id).await?;
+    let client = state.inner.smb.connect(&effective, &password).await?;
+    let transfer_ids = state.inner.transfers.begin_many(
+        app,
+        "upload",
+        items
+            .iter()
+            .map(|item| {
+                (
+                    item.remote.clone(),
+                    std::fs::metadata(&item.source)
+                        .map(|meta| meta.len())
+                        .unwrap_or(0),
+                )
+            })
+            .collect(),
+    );
+    let mut result = UploadResult {
+        uploaded: 0,
+        failed: 0,
+        errors: Vec::new(),
+    };
+    let mut bytes_done = 0u64;
+    for (index, item) in items.into_iter().enumerate() {
+        let target = join_rel(&dir, &item.remote);
+        let transfer_id = transfer_ids.get(index).cloned().unwrap_or_default();
+        state.inner.transfers.start(app, &transfer_id);
+        let file_bytes = std::fs::metadata(&item.source)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        let progress = |sent: u64, total: u64| {
+            state
+                .inner
+                .transfers
+                .progress(app, &transfer_id, sent, total);
+            let _ = on_progress.send(SyncProgress {
+                phase: "upload".to_string(),
+                current: index,
+                total: total as usize,
+                file: item.remote.clone(),
+                bytes: bytes_done + sent,
+                skipped: 0,
+                failed: result.failed,
+                message: None,
+            });
+        };
+        match state
+            .inner
+            .smb
+            .upload_file_with_progress(&client, &target, &item.source, &progress)
+            .await
+        {
+            Ok(_) => {
+                state.inner.transfers.finish(app, &transfer_id, None);
+                result.uploaded += 1;
+                bytes_done += file_bytes;
+            }
+            Err(error) => {
+                let message = error.to_string();
+                state
+                    .inner
+                    .transfers
+                    .finish(app, &transfer_id, Some(message.clone()));
+                result.failed += 1;
+                result.errors.push(format!("{}: {message}", item.remote));
+            }
+        }
+        #[cfg(target_os = "android")]
+        {
+            let _ = tokio::fs::remove_file(&item.source).await;
+        }
+        android_progress::update(
+            app,
+            "Загрузка на NAS",
+            &result
+                .errors
+                .last()
+                .cloned()
+                .unwrap_or_else(|| format!("Загружено: {}", result.uploaded)),
+            index + 1,
+            total,
+            false,
+        )
+        .await;
+    }
+    state.inner.smb.reset().await;
+    let _ = on_progress.send(SyncProgress {
+        phase: "done".to_string(),
+        current: total,
+        total,
+        file: String::new(),
+        bytes: bytes_done,
+        skipped: 0,
+        failed: result.failed,
+        message: result.errors.last().cloned(),
+    });
+    android_progress::update(
+        app,
+        "Загрузка завершена",
+        &format!("Загружено: {} из {total}", result.uploaded),
+        total,
+        total,
+        true,
+    )
+    .await;
+    crate::integration::notify(
+        app,
+        if result.failed > 0 { "error" } else { "upload" },
+        "Загрузка на NAS",
+        &format!(
+            "Загружено: {}, ошибок: {}",
+            result.uploaded, result.failed
+        ),
+    );
+    Ok(result)
+}
+
 #[tauri::command]
 pub async fn upload_files(
     app: AppHandle,
     state: State<'_, AppState>,
     remote_dir: String,
+    media_only: Option<bool>,
+    on_progress: Channel<SyncProgress>,
 ) -> AppResult<UploadResult> {
-    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    let mut items: Vec<UploadItem> = Vec::new();
 
     #[cfg(not(target_os = "android"))]
     {
@@ -1382,7 +1968,10 @@ pub async fn upload_files(
                     .and_then(|value| value.to_str())
                     .unwrap_or("file")
                     .to_string();
-                files.push((path, name));
+                items.push(UploadItem {
+                    source: path,
+                    remote: remote_file_name(&name),
+                });
             }
         }
     }
@@ -1392,117 +1981,65 @@ pub async fn upload_files(
         let response: PickFilesResponse =
             android_bridge::call(&app, "pickFiles", serde_json::json!({})).await?;
         for file in response.files {
-            files.push((PathBuf::from(file.path), file.name));
+            items.push(UploadItem {
+                source: PathBuf::from(file.path),
+                remote: remote_file_name(&file.name),
+            });
         }
     }
 
-    if files.is_empty() {
-        return Err(AppError::msg("Файлы не выбраны"));
-    }
-    let total = files.len();
-    android_progress::update(
+    upload_items(
         &app,
-        "Загрузка на NAS",
-        &format!("Файлов: {total}"),
-        0,
-        total,
-        false,
+        &state,
+        &remote_dir,
+        items,
+        media_only.unwrap_or(false),
+        on_progress,
     )
-    .await;
+    .await
+}
 
-    let cfg = state.config();
-    let password = state.password()?;
-    let effective =
-        zt_proxy::effective_smb_config(&app, &cfg.smb, &cfg.zerotier_network_id).await?;
-    let client = state.inner.smb.connect(&effective, &password).await?;
-    let dir = normalize_rel(&remote_dir);
-    let transfer_ids = state.inner.transfers.begin_many(
-        &app,
-        "upload",
-        files
-            .iter()
-            .map(|(path, name)| {
-                (
-                    remote_file_name(name),
-                    std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
-                )
+#[tauri::command]
+pub async fn upload_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    remote_dir: String,
+    on_progress: Channel<SyncProgress>,
+) -> AppResult<UploadResult> {
+    #[cfg(target_os = "android")]
+    {
+        let response: PickFilesResponse =
+            android_bridge::call(&app, "pickUploadFolder", serde_json::json!({})).await?;
+        let items = response
+            .files
+            .into_iter()
+            .map(|file| {
+                let relative = file.relative_path.unwrap_or(file.name);
+                UploadItem {
+                    source: PathBuf::from(file.path),
+                    remote: upload_remote_rel(&relative),
+                }
             })
-            .collect(),
-    );
-    let mut result = UploadResult {
-        uploaded: 0,
-        failed: 0,
-        errors: Vec::new(),
-    };
-    for (index, (path, name)) in files.into_iter().enumerate() {
-        let remote_name = remote_file_name(&name);
-        let target = join_rel(&dir, &remote_name);
-        let transfer_id = transfer_ids.get(index).cloned().unwrap_or_default();
-        state.inner.transfers.start(&app, &transfer_id);
-        let progress = |sent: u64, total: u64| {
-            state
-                .inner
-                .transfers
-                .progress(&app, &transfer_id, sent, total);
-        };
-        match state
-            .inner
-            .smb
-            .upload_file_with_progress(&client, &target, &path, &progress)
-            .await
-        {
-            Ok(_) => {
-                state.inner.transfers.finish(&app, &transfer_id, None);
-                result.uploaded += 1;
-            }
-            Err(error) => {
-                let message = error.to_string();
-                state
-                    .inner
-                    .transfers
-                    .finish(&app, &transfer_id, Some(message.clone()));
-                result.failed += 1;
-                result.errors.push(format!("{remote_name}: {message}"));
-            }
-        }
-        #[cfg(target_os = "android")]
-        {
-            let _ = tokio::fs::remove_file(&path).await;
-        }
-        android_progress::update(
-            &app,
-            "Загрузка на NAS",
-            &result
-                .errors
-                .last()
-                .cloned()
-                .unwrap_or_else(|| format!("Загружено: {}", result.uploaded)),
-            index + 1,
-            total,
-            false,
-        )
-        .await;
+            .collect();
+        upload_items(&app, &state, &remote_dir, items, false, on_progress).await
     }
-    state.inner.smb.reset().await;
-    android_progress::update(
-        &app,
-        "Загрузка завершена",
-        &format!("Загружено: {} из {total}", result.uploaded),
-        total,
-        total,
-        true,
-    )
-    .await;
-    crate::integration::notify(
-        &app,
-        if result.failed > 0 { "error" } else { "upload" },
-        "Загрузка на NAS",
-        &format!(
-            "Загружено: {}, ошибок: {}",
-            result.uploaded, result.failed
-        ),
-    );
-    Ok(result)
+    #[cfg(not(target_os = "android"))]
+    {
+        use tauri_plugin_dialog::DialogExt;
+        let app_for_dialog = app.clone();
+        let picked = tokio::task::spawn_blocking(move || {
+            app_for_dialog.dialog().file().blocking_pick_folders()
+        })
+        .await
+        .map_err(|error| AppError::msg(error.to_string()))?;
+        let mut items = Vec::new();
+        for folder in picked.unwrap_or_default() {
+            if let Ok(path) = folder.into_path() {
+                items.extend(folder_upload_items(&path));
+            }
+        }
+        upload_items(&app, &state, &remote_dir, items, false, on_progress).await
+    }
 }
 
 fn unique_local_path(path: &std::path::Path) -> PathBuf {
@@ -1531,15 +2068,18 @@ pub async fn download_file(
     path: String,
     relative_dir: Option<String>,
     conflict_policy: Option<String>,
+    on_progress: Channel<SyncProgress>,
 ) -> AppResult<String> {
-    let cfg = state.config();
+    let _guard = state.inner.smb_lock.lock().await;
+    let app_cfg = state.config();
     let password = state.password()?;
+    let (smb_cfg, remote_path, _) = resolve_remote_path(&app_cfg, &path)?;
     let effective =
-        zt_proxy::effective_smb_config(&app, &cfg.smb, &cfg.zerotier_network_id).await?;
+        zt_proxy::effective_smb_config(&app, &smb_cfg, &app_cfg.zerotier_network_id).await?;
     let client = state.inner.smb.connect(&effective, &password).await?;
-    let mut name = remote_file_name(&path);
+    let mut name = remote_file_name(&remote_path);
     if std::path::Path::new(&name).extension().is_none() {
-        if let Some(extension) = std::path::Path::new(&path).extension() {
+        if let Some(extension) = std::path::Path::new(&remote_path).extension() {
             name = format!("{}.{}", name, extension.to_string_lossy());
         }
     }
@@ -1563,11 +2103,21 @@ pub async fn download_file(
             .inner
             .transfers
             .progress(&app, &transfer_id, sent, total);
+        let _ = on_progress.send(SyncProgress {
+            phase: "download".to_string(),
+            current: sent as usize,
+            total: total as usize,
+            file: name.clone(),
+            bytes: sent,
+            skipped: 0,
+            failed: 0,
+            message: None,
+        });
     };
     if let Err(error) = state
         .inner
         .smb
-        .download_file_with_progress(&client, &path, &temp_path, &progress)
+        .download_file_with_progress(&client, &remote_path, &temp_path, &progress)
         .await
     {
         state
@@ -1613,8 +2163,8 @@ pub async fn download_file(
 
     #[cfg(not(target_os = "android"))]
     {
-        let configured_dir = cfg.download_dir.trim().to_string();
-        let mut target = if !cfg.download_auto_save || configured_dir.is_empty() {
+        let configured_dir = app_cfg.download_dir.trim().to_string();
+        let mut target = if !app_cfg.download_auto_save || configured_dir.is_empty() {
             use tauri_plugin_dialog::DialogExt;
             let app_for_dialog = app.clone();
             let name_for_dialog = name.clone();
@@ -1644,7 +2194,7 @@ pub async fn download_file(
                 .as_deref()
                 .unwrap_or("")
                 .trim_matches(|ch| ch == '/' || ch == '\\');
-            if cfg.download_keep_structure && !relative.is_empty() {
+            if app_cfg.download_keep_structure && !relative.is_empty() {
                 dir = dir.join(relative);
             }
             std::fs::create_dir_all(&dir)?;
@@ -1685,10 +2235,12 @@ pub async fn read_text_file(
     state: State<'_, AppState>,
     path: String,
 ) -> AppResult<String> {
-    let cfg = state.config();
+    let _guard = state.inner.smb_lock.lock().await;
+    let app_cfg = state.config();
     let password = state.password()?;
+    let (cfg, path, _) = resolve_remote_path(&app_cfg, &path)?;
     let effective =
-        zt_proxy::effective_smb_config(&app, &cfg.smb, &cfg.zerotier_network_id).await?;
+        zt_proxy::effective_smb_config(&app, &cfg, &app_cfg.zerotier_network_id).await?;
     let client = state.inner.smb.connect(&effective, &password).await?;
     let len = state.inner.smb.file_len(&client, "", &path).await?;
     const LIMIT: u64 = 512 * 1024;
@@ -1711,11 +2263,13 @@ pub async fn read_file_bytes(
     state: State<'_, AppState>,
     path: String,
 ) -> AppResult<tauri::ipc::Response> {
+    let _guard = state.inner.smb_lock.lock().await;
     let operation = async {
-        let cfg = state.config();
+        let app_cfg = state.config();
         let password = state.password()?;
+        let (cfg, path, _) = resolve_remote_path(&app_cfg, &path)?;
         let effective =
-            zt_proxy::effective_smb_config(&app, &cfg.smb, &cfg.zerotier_network_id).await?;
+            zt_proxy::effective_smb_config(&app, &cfg, &app_cfg.zerotier_network_id).await?;
         let client = state.inner.smb.connect(&effective, &password).await?;
         let len = state.inner.smb.file_len(&client, "", &path).await?;
         const LIMIT: u64 = 32 * 1024 * 1024;
@@ -1741,10 +2295,11 @@ pub async fn read_media_bytes(
 ) -> AppResult<tauri::ipc::Response> {
     let operation = async {
         let _guard = state.inner.media_lock.lock().await;
-        let cfg = state.config();
+        let app_cfg = state.config();
         let password = state.password()?;
+        let (cfg, path, _) = resolve_remote_path(&app_cfg, &path)?;
         let effective =
-            zt_proxy::effective_smb_config(&app, &cfg.smb, &cfg.zerotier_network_id).await?;
+            zt_proxy::effective_smb_config(&app, &cfg, &app_cfg.zerotier_network_id).await?;
         let client = state.inner.media_smb.connect(&effective, &password).await?;
         let len = state.inner.media_smb.file_len(&client, "", &path).await?;
         const LIMIT: u64 = 32 * 1024 * 1024;
@@ -1833,16 +2388,17 @@ pub async fn download_gallery(
     conflict_policy: Option<String>,
     on_progress: Channel<SyncProgress>,
 ) -> AppResult<DownloadResult> {
-    let cfg = state.config();
+    let _guard = state.inner.smb_lock.lock().await;
+    let app_cfg = state.config();
     let password = state.password()?;
+    let (smb_cfg, root, _) = resolve_remote_path(&app_cfg, &remote_path)?;
     let effective =
-        zt_proxy::effective_smb_config(&app, &cfg.smb, &cfg.zerotier_network_id).await?;
+        zt_proxy::effective_smb_config(&app, &smb_cfg, &app_cfg.zerotier_network_id).await?;
     let client = state.inner.smb.connect(&effective, &password).await?;
-    let root = normalize_rel(&remote_path);
     let root_name = remote_file_name(root.rsplit('/').next().unwrap_or("Gallery"));
 
     let mut queue = VecDeque::from([root.clone()]);
-    let mut files = Vec::new();
+    let mut files: Vec<(String, u64)> = Vec::new();
     let mut folders = Vec::new();
     while let Some(dir) = queue.pop_front() {
         match state.inner.smb.list_dir(&client, "", &dir).await {
@@ -1852,7 +2408,7 @@ pub async fn download_gallery(
                         folders.push(entry.path.clone());
                         queue.push_back(entry.path);
                     } else {
-                        files.push(entry.path);
+                        files.push((entry.path, entry.size));
                     }
                 }
             }
@@ -1865,7 +2421,7 @@ pub async fn download_gallery(
     }
 
     #[cfg(not(target_os = "android"))]
-    let destination = if !cfg.download_auto_save || cfg.download_dir.trim().is_empty() {
+    let destination = if !app_cfg.download_auto_save || app_cfg.download_dir.trim().is_empty() {
         use tauri_plugin_dialog::DialogExt;
         let app_for_dialog = app.clone();
         let picked = tokio::task::spawn_blocking(move || {
@@ -1877,7 +2433,7 @@ pub async fn download_gallery(
             .and_then(|folder| folder.into_path().ok())
             .ok_or_else(|| AppError::msg("Скачивание отменено"))?
     } else {
-        PathBuf::from(cfg.download_dir.trim())
+        PathBuf::from(app_cfg.download_dir.trim())
     };
 
     #[cfg(target_os = "android")]
@@ -1886,7 +2442,7 @@ pub async fn download_gallery(
     #[cfg(not(target_os = "android"))]
     {
         std::fs::create_dir_all(&destination)?;
-        if cfg.download_keep_structure {
+        if app_cfg.download_keep_structure {
             let base = destination.join(&root_name);
             std::fs::create_dir_all(&base)?;
             for folder in &folders {
@@ -1902,6 +2458,19 @@ pub async fn download_gallery(
     }
 
     let total = files.len();
+    let total_bytes = files.iter().map(|(_, size)| *size).sum::<u64>();
+    let folder_transfer = state
+        .inner
+        .transfers
+        .begin_many(
+            &app,
+            "download",
+            vec![(format!("{root_name} (папка)"), total_bytes)],
+        )
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    state.inner.transfers.start(&app, &folder_transfer);
     android_progress::update(
         &app,
         "Скачивание с NAS",
@@ -1924,7 +2493,7 @@ pub async fn download_gallery(
         .app_cache_dir()
         .map_err(|error| AppError::msg(error.to_string()))?
         .join("downloads");
-    for (index, file) in files.iter().enumerate() {
+    for (index, (file, _size)) in files.iter().enumerate() {
         let relative = file
             .strip_prefix(&root)
             .unwrap_or(file)
@@ -1933,7 +2502,7 @@ pub async fn download_gallery(
         let outcome: AppResult<Option<u64>> = async {
             #[cfg(not(target_os = "android"))]
             {
-                let mut target = if cfg.download_keep_structure {
+                let mut target = if app_cfg.download_keep_structure {
                     destination.join(&root_name).join(&relative)
                 } else {
                     let name = relative.rsplit('/').next().unwrap_or(&relative);
@@ -2021,6 +2590,10 @@ pub async fn download_gallery(
             failed: result.failed,
             message: result.errors.last().cloned(),
         });
+        state
+            .inner
+            .transfers
+            .progress(&app, &folder_transfer, result.bytes, total_bytes);
         android_progress::update(
             &app,
             "Скачивание с NAS",
@@ -2044,6 +2617,15 @@ pub async fn download_gallery(
         true,
     )
     .await;
+    state.inner.transfers.finish(
+        &app,
+        &folder_transfer,
+        if result.failed > 0 {
+            Some(format!("Ошибок: {}", result.failed))
+        } else {
+            None
+        },
+    );
     crate::integration::notify(
         &app,
         if result.failed > 0 { "error" } else { "download" },
@@ -2083,23 +2665,45 @@ pub async fn delete_paths(
     state: State<'_, AppState>,
     paths: Vec<String>,
 ) -> AppResult<DeleteResult> {
-    let cfg = state.config();
+    let _guard = state.inner.smb_lock.lock().await;
+    let app_cfg = state.config();
     let password = state.password()?;
-    let effective =
-        zt_proxy::effective_smb_config(&app, &cfg.smb, &cfg.zerotier_network_id).await?;
-    let client = state.inner.smb.connect(&effective, &password).await?;
     let mut result = DeleteResult {
         deleted: 0,
         failed: 0,
         errors: Vec::new(),
     };
     for path in paths {
-        let relative = normalize_rel(&path);
+        let (cfg, relative, _) = match resolve_remote_path(&app_cfg, &path) {
+            Ok(value) => value,
+            Err(error) => {
+                result.failed += 1;
+                result.errors.push(error.to_string());
+                continue;
+            }
+        };
         if relative.is_empty() {
             result.failed += 1;
             result.errors.push("Пустой путь".to_string());
             continue;
         }
+        let effective =
+            match zt_proxy::effective_smb_config(&app, &cfg, &app_cfg.zerotier_network_id).await {
+                Ok(effective) => effective,
+                Err(error) => {
+                    result.failed += 1;
+                    result.errors.push(format!("{relative}: {error}"));
+                    continue;
+                }
+            };
+        let client = match state.inner.smb.connect(&effective, &password).await {
+            Ok(client) => client,
+            Err(error) => {
+                result.failed += 1;
+                result.errors.push(format!("{relative}: {error}"));
+                continue;
+            }
+        };
         match state.inner.smb.delete_tree(&client, &relative).await {
             Ok(()) => result.deleted += 1,
             Err(error) => {
@@ -2116,14 +2720,15 @@ pub async fn create_folder(
     state: State<'_, AppState>,
     path: String,
 ) -> AppResult<()> {
-    let cfg = state.config();
+    let _guard = state.inner.smb_lock.lock().await;
+    let app_cfg = state.config();
     let password = state.password()?;
+    let (cfg, relative, _) = resolve_remote_path(&app_cfg, &path)?;
     let effective =
-        zt_proxy::effective_smb_config(&app, &cfg.smb, &cfg.zerotier_network_id).await?;
+        zt_proxy::effective_smb_config(&app, &cfg, &app_cfg.zerotier_network_id).await?;
     let client = state.inner.smb.connect(&effective, &password).await?;
-    let relative = normalize_rel(&path);
     if relative.is_empty() {
-        return Err(AppError::msg("Пустое имя папки"));
+        return Err(AppError::msg("Пустой путь папки"));
     }
     state.inner.smb.create_dir_path(&client, &relative).await
 }

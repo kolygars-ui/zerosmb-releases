@@ -35,6 +35,10 @@ impl Default for SmbConfig {
 
 impl SmbConfig {
     pub fn account(&self) -> String {
+        format!("{}|{}@{}", self.domain, self.username, self.host)
+    }
+
+    pub fn legacy_account(&self) -> String {
         format!(
             "{}|{}@{}|{}",
             self.domain, self.username, self.host, self.share
@@ -76,9 +80,6 @@ impl SmbConfig {
     pub fn validate(&self) -> AppResult<()> {
         if self.host.trim().is_empty() {
             return Err(AppError::msg("Укажите адрес NAS (host/IP)"));
-        }
-        if self.share.trim().is_empty() {
-            return Err(AppError::msg("Укажите SMB-ресурс (share)"));
         }
         if self.username.trim().is_empty() {
             return Err(AppError::msg("Укажите имя пользователя SMB"));
@@ -132,9 +133,13 @@ pub struct AppConfig {
     #[serde(default)]
     pub connection_mode: String,
     #[serde(default)]
+    pub zerotier_mode: String,
+    #[serde(default)]
     pub smb: SmbConfig,
     #[serde(default)]
     pub sync_jobs: Vec<SyncJob>,
+    #[serde(default)]
+    pub gallery_share: String,
     #[serde(default = "default_gallery_path")]
     pub remote_gallery_path: String,
     #[serde(default = "default_true")]
@@ -159,6 +164,8 @@ pub struct AppConfig {
     pub external_save_mode: String,
     #[serde(default)]
     pub download_dir: String,
+    #[serde(default = "default_diagnostics_path")]
+    pub diagnostics_path: String,
     #[serde(default = "default_true")]
     pub download_auto_save: bool,
     #[serde(default = "default_true")]
@@ -213,8 +220,20 @@ fn default_gallery_path() -> String {
     "Gallery".to_string()
 }
 
+fn default_diagnostics_path() -> String {
+    "Diagnostics".to_string()
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn default_zerotier_mode() -> String {
+    if cfg!(target_os = "android") {
+        "embedded".to_string()
+    } else {
+        "system".to_string()
+    }
 }
 
 fn default_gallery_columns() -> u8 {
@@ -258,6 +277,14 @@ pub fn normalize_connection_mode(mode: &str) -> Option<&'static str> {
     }
 }
 
+pub fn normalize_zerotier_mode(mode: &str) -> Option<&'static str> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "embedded" => Some("embedded"),
+        "system" => Some("system"),
+        _ => None,
+    }
+}
+
 pub fn suggested_gallery_path(smb: &SmbConfig) -> String {
     let user = smb
         .username
@@ -284,8 +311,10 @@ impl Default for AppConfig {
             setup_complete: false,
             zerotier_network_id: String::new(),
             connection_mode: String::new(),
+            zerotier_mode: default_zerotier_mode(),
             smb: SmbConfig::default(),
             sync_jobs: Vec::new(),
+            gallery_share: String::new(),
             remote_gallery_path: default_gallery_path(),
             gallery_enabled: true,
             gallery_columns: default_gallery_columns(),
@@ -298,6 +327,7 @@ impl Default for AppConfig {
             external_save_enabled: true,
             external_save_mode: default_external_save_mode(),
             download_dir: String::new(),
+            diagnostics_path: default_diagnostics_path(),
             download_auto_save: true,
             download_keep_structure: true,
             system_install_dir: String::new(),
@@ -338,6 +368,16 @@ impl AppConfig {
         } else {
             "local"
         }
+    }
+
+    pub fn resolved_zerotier_mode(&self) -> &'static str {
+        normalize_zerotier_mode(&self.zerotier_mode).unwrap_or_else(|| {
+            if cfg!(target_os = "android") {
+                "embedded"
+            } else {
+                "system"
+            }
+        })
     }
 
     pub fn load(dir: &Path) -> Self {
@@ -385,10 +425,19 @@ struct SecretsFile {
 pub fn load_password(dir: &Path, smb: &SmbConfig) -> Option<String> {
     #[cfg(not(target_os = "android"))]
     {
-        if let Ok(entry) = keyring::Entry::new("ZeroSMB", &smb.account()) {
-            if let Ok(password) = entry.get_password() {
-                if !password.is_empty() {
-                    return Some(password);
+        let current = smb.account();
+        let legacy = smb.legacy_account();
+        for account in [&current, &legacy] {
+            if let Ok(entry) = keyring::Entry::new("ZeroSMB", account) {
+                if let Ok(password) = entry.get_password() {
+                    if !password.is_empty() {
+                        if account == &legacy {
+                            if let Ok(migrated) = keyring::Entry::new("ZeroSMB", &current) {
+                                let _ = migrated.set_password(&password);
+                            }
+                        }
+                        return Some(password);
+                    }
                 }
             }
         }
@@ -430,8 +479,10 @@ pub fn save_password(dir: &Path, smb: &SmbConfig, password: &str) -> AppResult<(
 pub fn clear_password(dir: &Path, smb: &SmbConfig) {
     #[cfg(not(target_os = "android"))]
     {
-        if let Ok(entry) = keyring::Entry::new("ZeroSMB", &smb.account()) {
-            let _ = entry.delete_credential();
+        for account in [smb.account(), smb.legacy_account()] {
+            if let Ok(entry) = keyring::Entry::new("ZeroSMB", &account) {
+                let _ = entry.delete_credential();
+            }
         }
     }
     let _ = std::fs::remove_file(secrets_path(dir));

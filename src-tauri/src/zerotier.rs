@@ -25,35 +25,44 @@ pub struct ZtStatus {
 }
 
 #[cfg(not(target_os = "android"))]
-fn token_candidates() -> Vec<std::path::PathBuf> {
+fn system_dirs() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if let Ok(home) = std::env::var("ZEROTIER_HOME") {
-        out.push(std::path::PathBuf::from(home).join("authtoken.secret"));
+        out.push(std::path::PathBuf::from(home));
     }
     #[cfg(windows)]
     {
-        out.push(std::path::PathBuf::from(
-            r"C:\ProgramData\ZeroTier\One\authtoken.secret",
-        ));
+        out.push(std::path::PathBuf::from(r"C:\ProgramData\ZeroTier\One"));
         if let Ok(program_data) = std::env::var("ProgramData") {
             out.push(
                 std::path::PathBuf::from(program_data)
                     .join("ZeroTier")
-                    .join("One")
-                    .join("authtoken.secret"),
+                    .join("One"),
             );
         }
     }
     #[cfg(not(windows))]
     {
+        out.push(std::path::PathBuf::from("/var/lib/zerotier-one"));
+        out.push(std::path::PathBuf::from("/var/db/zerotier-one"));
+        out.push(std::path::PathBuf::from("/var/snap/zerotier/current"));
+        out.push(std::path::PathBuf::from("/var/snap/zerotier/common"));
         out.push(std::path::PathBuf::from(
-            "/var/lib/zerotier-one/authtoken.secret",
+            "/var/snap/zerotier/current/zerotier-one",
         ));
         out.push(std::path::PathBuf::from(
-            "/var/db/zerotier-one/authtoken.secret",
+            "/var/snap/zerotier/common/zerotier-one",
         ));
     }
     out
+}
+
+#[cfg(not(target_os = "android"))]
+fn token_candidates() -> Vec<std::path::PathBuf> {
+    system_dirs()
+        .into_iter()
+        .map(|dir| dir.join("authtoken.secret"))
+        .collect()
 }
 
 #[cfg(not(target_os = "android"))]
@@ -73,11 +82,18 @@ fn cli_candidates() -> Vec<std::path::PathBuf> {
         out.push(std::path::PathBuf::from(
             r"C:\ProgramData\ZeroTier\One\zerotier-cli.bat",
         ));
+        out.push(std::path::PathBuf::from(
+            r"C:\Program Files (x86)\ZeroTier\One\zerotier-cli.bat",
+        ));
+        out.push(std::path::PathBuf::from(
+            r"C:\Program Files\ZeroTier\One\zerotier-cli.bat",
+        ));
         out.push(std::path::PathBuf::from("zerotier-cli.bat"));
         out.push(std::path::PathBuf::from("zerotier-cli"));
     }
     #[cfg(not(windows))]
     {
+        out.push(std::path::PathBuf::from("/snap/bin/zerotier-cli"));
         out.push(std::path::PathBuf::from("/usr/sbin/zerotier-cli"));
         out.push(std::path::PathBuf::from("/usr/bin/zerotier-cli"));
         out.push(std::path::PathBuf::from("zerotier-cli"));
@@ -571,4 +587,257 @@ pub async fn embedded_stop(app: &tauri::AppHandle) -> AppResult<ZtStatus> {
     let status: EmbeddedStatus =
         crate::android_bridge::call(app, "ztStop", serde_json::json!({})).await?;
     Ok(map_embedded(status))
+}
+#[cfg(not(target_os = "android"))]
+fn system_planet_path() -> Option<std::path::PathBuf> {
+    let dirs = system_dirs();
+    let found = dirs
+        .iter()
+        .find(|dir| dir.join("authtoken.secret").is_file() || dir.join("identity.public").is_file())
+        .or_else(|| dirs.iter().find(|dir| dir.is_dir()))?;
+    Some(found.join("planet"))
+}
+
+#[cfg(not(target_os = "android"))]
+fn system_planet_backup(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_file_name("planet.zerosmb-backup")
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn system_planet_location() -> Option<String> {
+    system_planet_path().map(|path| path.display().to_string())
+}
+
+#[cfg(not(target_os = "android"))]
+const DEFAULT_PLANET_WORLD_ID: u64 = 149604618;
+
+#[cfg(not(target_os = "android"))]
+fn planet_world_id(path: &std::path::Path) -> Option<u64> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() < 12 {
+        return None;
+    }
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&data[4..12]);
+    Some(u64::from_be_bytes(bytes))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn system_planet_world_id() -> Option<u64> {
+    system_planet_path().and_then(|path| planet_world_id(&path))
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn system_planet_managed() -> bool {
+    system_planet_path()
+        .map(|path| system_planet_backup(&path).is_file())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn system_planet_configured() -> bool {
+    if let Some(world_id) = system_planet_world_id() {
+        return world_id != DEFAULT_PLANET_WORLD_ID;
+    }
+    system_planet_managed()
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn system_planet_size() -> u64 {
+    system_planet_path()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+
+
+#[cfg(not(target_os = "android"))]
+fn script_temp_path(name: &str) -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("zerosmb-{name}-{}-{stamp}", std::process::id()))
+}
+
+#[cfg(not(target_os = "android"))]
+fn read_script_result(path: &std::path::Path) -> AppResult<String> {
+    let result = std::fs::read_to_string(path).unwrap_or_default();
+    let result = result.trim().trim_start_matches('\u{feff}').trim().to_string();
+    if result.is_empty() {
+        return Err(AppError::msg(
+            "ZeroTier: действие отменено или завершилось без результата",
+        ));
+    }
+    if result.eq_ignore_ascii_case("OK") {
+        Ok(result)
+    } else {
+        Err(AppError::msg(format!("ZeroTier: {result}")))
+    }
+}
+
+#[cfg(windows)]
+fn apply_system_planet_blocking(
+    source: Option<&std::path::Path>,
+    destination: &std::path::Path,
+    backup: &std::path::Path,
+) -> AppResult<String> {
+    let script_path = script_temp_path("zt-planet.ps1");
+    let result_path = script_temp_path("zt-planet-result.txt");
+    let _ = std::fs::remove_file(&result_path);
+
+    let action = if let Some(source) = source {
+        format!(
+            "New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null\r\nif ((Test-Path -LiteralPath $dst) -and -not (Test-Path -LiteralPath $backup)) {{ Copy-Item -LiteralPath $dst -Destination $backup -Force }}\r\nCopy-Item -LiteralPath '{}' -Destination $dst -Force",
+            source.display().to_string().replace('\'', "''")
+        )
+    } else {
+        "if (Test-Path -LiteralPath $backup) { Move-Item -LiteralPath $backup -Destination $dst -Force } else { Remove-Item -LiteralPath $dst -Force -ErrorAction SilentlyContinue }".to_string()
+    };
+
+    let template = r#"$ErrorActionPreference = 'Stop'
+$result = '__RESULT__'
+try {
+  $dst = '__DST__'
+  $backup = '__BACKUP__'
+  __ACTION__
+  $svc = Get-Service | Where-Object { $_.Name -eq 'ZeroTierOneService' -or $_.DisplayName -like 'ZeroTier One*' } | Select-Object -First 1
+  if (-not $svc) { throw 'Служба ZeroTier One не найдена' }
+  Restart-Service -Name $svc.Name -Force
+  Set-Content -LiteralPath $result -Value 'OK' -Encoding UTF8
+} catch {
+  Set-Content -LiteralPath $result -Value $_.Exception.Message -Encoding UTF8
+  exit 1
+}
+"#;
+    let script = template
+        .replace("__RESULT__", &result_path.display().to_string().replace('\'', "''"))
+        .replace("__DST__", &destination.display().to_string().replace('\'', "''"))
+        .replace("__BACKUP__", &backup.display().to_string().replace('\'', "''"))
+        .replace("__ACTION__", &action);
+    std::fs::write(&script_path, script)?;
+
+    let escaped = script_path.display().to_string().replace('\'', "''");
+    let command = format!(
+        "$p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','{escaped}') -Verb RunAs -Wait -PassThru; exit $p.ExitCode"
+    );
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+        .status()?;
+    let result = read_script_result(&result_path);
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&result_path);
+    if !status.success() && result.is_err() {
+        return Err(AppError::msg(
+            "ZeroTier: запрос прав администратора отклонён или служба не перезапущена",
+        ));
+    }
+    result
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+fn apply_system_planet_blocking(
+    source: Option<&std::path::Path>,
+    destination: &std::path::Path,
+    backup: &std::path::Path,
+) -> AppResult<String> {
+    if !which("pkexec") {
+        return Err(AppError::msg(
+            "ZeroTier: для изменения системного planet нужен pkexec (polkit).",
+        ));
+    }
+    let script_path = script_temp_path("zt-planet.sh");
+    let result_path = script_temp_path("zt-planet-result.txt");
+    let _ = std::fs::remove_file(&result_path);
+
+    let action = if let Some(source) = source {
+        format!(
+            "mkdir -p \"$(dirname \"$dst\")\"\nif [ -f \"$dst\" ] && [ ! -f \"$backup\" ]; then cp -p \"$dst\" \"$backup\"; fi\ncp -f '{}' \"$dst\"",
+            source.display().to_string().replace('\'', "'\\''")
+        )
+    } else {
+        "if [ -f \"$backup\" ]; then mv -f \"$backup\" \"$dst\"; else rm -f \"$dst\"; fi"
+            .to_string()
+    };
+    let template = r#"#!/bin/sh
+set -eu
+result='__RESULT__'
+dst='__DST__'
+backup='__BACKUP__'
+__ACTION__
+case "$dst" in
+  /var/snap/*)
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^snap.zerotier.zerotier-one'; then
+      systemctl restart snap.zerotier.zerotier-one
+    elif command -v snap >/dev/null 2>&1; then
+      snap restart zerotier
+    fi
+    ;;
+  *)
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl restart zerotier-one
+    fi
+    ;;
+esac
+printf 'OK\n' > "$result"
+"#;
+    let script = template
+        .replace("__RESULT__", &result_path.display().to_string().replace('\'', "'\\''"))
+        .replace("__DST__", &destination.display().to_string().replace('\'', "'\\''"))
+        .replace("__BACKUP__", &backup.display().to_string().replace('\'', "'\\''"))
+        .replace("__ACTION__", &action);
+    std::fs::write(&script_path, script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700));
+    }
+    let status = std::process::Command::new("pkexec")
+        .arg("/bin/sh")
+        .arg(&script_path)
+        .status()?;
+    let result = read_script_result(&result_path);
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&result_path);
+    if !status.success() && result.is_err() {
+        return Err(AppError::msg(
+            "ZeroTier: запрос прав root отклонён или служба не перезапущена",
+        ));
+    }
+    result
+}
+
+#[cfg(not(target_os = "android"))]
+pub async fn install_planet(source: std::path::PathBuf) -> AppResult<String> {
+    tokio::task::spawn_blocking(move || {
+        if !source.is_file() {
+            return Err(AppError::msg("ZeroTier: файл planet не найден"));
+        }
+        let destination = system_planet_path()
+            .ok_or_else(|| AppError::msg("ZeroTier One не установлен в систему"))?;
+        let backup = system_planet_backup(&destination);
+        apply_system_planet_blocking(Some(&source), &destination, &backup)?;
+        Ok("OK".to_string())
+    })
+    .await
+    .map_err(|error| AppError::msg(error.to_string()))?
+}
+
+#[cfg(not(target_os = "android"))]
+pub async fn remove_planet() -> AppResult<String> {
+    tokio::task::spawn_blocking(move || {
+        let destination = system_planet_path()
+            .ok_or_else(|| AppError::msg("ZeroTier One не установлен в систему"))?;
+        let backup = system_planet_backup(&destination);
+        if !backup.is_file() {
+            return Err(AppError::msg(
+                "Этот planet установлен вручную. Автоматическое удаление доступно только для planet, установленного через ZeroSMB.",
+            ));
+        }
+        apply_system_planet_blocking(None, &destination, &backup)?;
+        Ok("OK".to_string())
+    })
+    .await
+    .map_err(|error| AppError::msg(error.to_string()))?
 }

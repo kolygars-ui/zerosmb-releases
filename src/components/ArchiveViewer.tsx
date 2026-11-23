@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as pdfjsLib from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { api, formatBytes, kindOfName, mimeFor } from "../api";
@@ -20,6 +20,23 @@ type Preview =
   | { kind: "pdf"; pages: string[]; total: number }
   | null;
 
+interface ArchiveRow {
+  entry: ArchiveEntry;
+  path: string;
+  name: string;
+  isDir: boolean;
+}
+
+function archivePath(value: string) {
+  return value.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+}
+
+function parentArchivePath(value: string) {
+  const path = archivePath(value);
+  const index = path.lastIndexOf("/");
+  return index < 0 ? "" : path.slice(0, index);
+}
+
 function PdfPreview({ buffer }: { buffer: ArrayBuffer }) {
   const [pages, setPages] = useState<string[]>([]);
   const [total, setTotal] = useState(0);
@@ -31,7 +48,7 @@ function PdfPreview({ buffer }: { buffer: ArrayBuffer }) {
     void (async () => {
       try {
         const pdf = await pdfjsLib.getDocument({
-          data: new Uint8Array(buffer),
+          data: new Uint8Array(buffer.slice(0)),
         }).promise;
         documentProxy = pdf;
         if (cancelled) return;
@@ -82,6 +99,7 @@ export default function ArchiveViewer({
   onClose,
 }: Props) {
   const [entries, setEntries] = useState<ArchiveEntry[]>([]);
+  const [currentDir, setCurrentDir] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [note, setNote] = useState("");
@@ -89,11 +107,14 @@ export default function ArchiveViewer({
   const [preview, setPreview] = useState<Preview>(null);
   const [pdfBuffer, setPdfBuffer] = useState<ArrayBuffer | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
   const objectUrl = useRef("");
 
   useEffect(() => {
     if (!open) return;
     setEntries([]);
+    setCurrentDir("");
+    setFullscreen(false);
     setSelected(null);
     setPreview(null);
     setPdfBuffer(null);
@@ -118,6 +139,43 @@ export default function ArchiveViewer({
     };
   }, [open, path]);
 
+  const rows = useMemo(() => {
+    const result = new Map<string, ArchiveRow>();
+    const base = currentDir ? `${currentDir}/` : "";
+    const lowerBase = base.toLowerCase();
+    for (const entry of entries) {
+      const full = archivePath(entry.name);
+      if (!full) continue;
+      let relative = full;
+      if (base) {
+        if (!full.toLowerCase().startsWith(lowerBase)) continue;
+        relative = full.slice(base.length);
+      }
+      relative = relative.replace(/^\/+/, "");
+      if (!relative) continue;
+      const slash = relative.indexOf("/");
+      if (slash >= 0) {
+        const name = relative.slice(0, slash);
+        const path = base ? `${currentDir}/${name}` : name;
+        if (!result.has(path)) {
+          result.set(path, {
+            entry: { ...entry, index: -1, name: path, isDir: true, size: 0 },
+            path,
+            name,
+            isDir: true,
+          });
+        }
+      } else {
+        const path = base ? `${currentDir}/${relative}` : relative;
+        result.set(path, { entry, path, name: relative, isDir: entry.isDir });
+      }
+    }
+    return [...result.values()].sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      return a.name.localeCompare(b.name, "ru");
+    });
+  }, [entries, currentDir]);
+
   if (!open) return null;
 
   const clearUrl = () => {
@@ -127,8 +185,19 @@ export default function ArchiveViewer({
     }
   };
 
-  const openEntry = async (entry: ArchiveEntry) => {
-    if (entry.isDir) return;
+  const openEntry = async (row: ArchiveRow) => {
+    const entry = row.entry;
+    if (row.isDir) {
+      setCurrentDir(row.path);
+      setFullscreen(false);
+      setSelected(null);
+      setPreview(null);
+      setPdfBuffer(null);
+      setNote("");
+      clearUrl();
+      return;
+    }
+    setFullscreen(false);
     setSelected(entry);
     setPreview(null);
     setPdfBuffer(null);
@@ -193,6 +262,7 @@ export default function ArchiveViewer({
   };
 
   return (
+    <>
     <div
       className="confirm-backdrop"
       onMouseDown={(event) => {
@@ -214,18 +284,42 @@ export default function ArchiveViewer({
         {note && <div className="hint" style={{ marginTop: 10 }}>{note}</div>}
         <div className="archive-layout">
           <div className="archive-list">
+            <div className="row archive-pathbar">
+              <button
+                className="btn ghost"
+                onClick={() => {
+                  setCurrentDir(parentArchivePath(currentDir));
+                  setFullscreen(false);
+                  setSelected(null);
+                  setPreview(null);
+                  setPdfBuffer(null);
+                  setNote("");
+                  clearUrl();
+                }}
+                disabled={!currentDir}
+              >
+                Назад
+              </button>
+              <span className="mono small" title={currentDir || "/"}>
+                /{currentDir}
+              </span>
+            </div>
             {loading && <div className="empty">Открытие архива…</div>}
+            {!loading && rows.length === 0 && <div className="empty">Папка пуста</div>}
             {!loading &&
-              entries.map((entry) => (
+              rows.map((row) => (
                 <button
-                  key={entry.index}
-                  className={`archive-row ${selected?.index === entry.index ? "active" : ""}`}
-                  onClick={() => void openEntry(entry)}
+                  key={row.path}
+                  className={`archive-row ${row.isDir ? "archive-dir" : ""} ${
+                    !row.isDir && selected?.index === row.entry.index ? "active" : ""
+                  }`}
+                  onClick={() => void openEntry(row)}
+                  title={row.path}
                 >
-                  <span className="archive-icon">{entry.isDir ? "DIR" : "FILE"}</span>
-                  <span className="archive-name">{entry.name}</span>
+                  <span className="archive-icon">{row.isDir ? "DIR" : "FILE"}</span>
+                  <span className="archive-name">{row.name}</span>
                   <span className="archive-size">
-                    {entry.isDir ? "" : formatBytes(entry.size)}
+                    {row.isDir ? "" : formatBytes(row.entry.size)}
                   </span>
                 </button>
               ))}
@@ -252,6 +346,11 @@ export default function ArchiveViewer({
         </div>
         {selected && !selected.isDir && (
           <div className="row end" style={{ marginTop: 12 }}>
+            {(preview || pdfBuffer) && (
+              <button className="btn" onClick={() => setFullscreen(true)}>
+                На весь экран
+              </button>
+            )}
             <button className="btn" onClick={() => void openEntryInSystem()}>
               Открыть в системе
             </button>
@@ -262,5 +361,31 @@ export default function ArchiveViewer({
         )}
       </div>
     </div>
+    {fullscreen && selected && (
+      <div
+        className="archive-fullscreen"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setFullscreen(false);
+        }}
+      >
+        <div className="archive-fullscreen-head">
+          <strong>{selected.name}</strong>
+          <button className="btn ghost" onClick={() => setFullscreen(false)}>
+            Закрыть
+          </button>
+        </div>
+        <div className="archive-fullscreen-stage">
+          {preview?.kind === "text" && (
+            <pre className="text-preview">{preview.text || "(файл пуст)"}</pre>
+          )}
+          {preview?.kind === "image" && <img src={preview.url} alt={selected.name} />}
+          {preview?.kind === "video" && (
+            <video src={preview.url} controls autoPlay playsInline />
+          )}
+          {preview?.kind === "pdf" && pdfBuffer && <PdfPreview buffer={pdfBuffer} />}
+        </div>
+      </div>
+    )}
+    </>
   );
 }

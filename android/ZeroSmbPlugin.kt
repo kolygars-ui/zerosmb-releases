@@ -968,6 +968,89 @@ class ZeroSmbPlugin(private val activity: Activity) : Plugin(activity) {
         }.start()
     }
 
+    @Command
+    fun pickUploadFolder(invoke: Invoke) {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            )
+        }
+        startActivityForResult(invoke, intent, "onUploadFolderPicked")
+    }
+
+    @ActivityCallback
+    fun onUploadFolderPicked(invoke: Invoke, result: ActivityResult) {
+        if (result.resultCode != Activity.RESULT_OK) {
+            val ret = JSObject()
+            ret.put("cancelled", true)
+            invoke.resolve(ret)
+            return
+        }
+        val uri = result.data?.data
+        if (uri == null) {
+            invoke.reject("Папка не выбрана")
+            return
+        }
+        try {
+            activity.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        } catch (_: Exception) {
+        }
+        Thread {
+            try {
+                val rootId = DocumentsContract.getTreeDocumentId(uri)
+                val rootName = rootId.substringAfterLast(':').ifBlank { "Папка" }
+                val files = JSArray()
+                exportUploadTree(uri, rootId, "", rootName, files)
+                val ret = JSObject()
+                ret.put("files", files)
+                invoke.resolve(ret)
+            } catch (error: Exception) {
+                invoke.reject(error.message ?: "Не удалось прочитать папку")
+            }
+        }.start()
+    }
+
+    private fun exportUploadTree(
+        treeUri: Uri,
+        parentDocId: String,
+        prefix: String,
+        rootName: String,
+        out: JSArray
+    ) {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE
+        )
+        activity.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+            val idCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            while (cursor.moveToNext()) {
+                val docId = cursor.getString(idCol) ?: continue
+                val name = cursor.getString(nameCol) ?: continue
+                val mime = cursor.getString(mimeCol) ?: ""
+                val relative = if (prefix.isEmpty()) name else "$prefix/$name"
+                if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                    exportUploadTree(treeUri, docId, relative, rootName, out)
+                } else {
+                    val childUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                    val file = exportUri(childUri, name)
+                    val item = JSObject()
+                    item.put("path", file.absolutePath)
+                    item.put("name", name)
+                    item.put("relativePath", "$rootName/$relative")
+                    out.put(item)
+                }
+            }
+        }
+    }
+
     private fun displayName(uri: Uri): String {
         try {
             activity.contentResolver.query(

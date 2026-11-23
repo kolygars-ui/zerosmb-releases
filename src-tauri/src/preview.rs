@@ -1,18 +1,19 @@
 use crate::error::{AppError, AppResult};
-use crate::smb_service::normalize_rel;
 use crate::state::AppState;
 use crate::zt_proxy;
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, State};
 use unrar_rs::RarArchive;
 use zip::ZipArchive;
 
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const ARCHIVE_PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,20 +76,45 @@ async fn read_remote_bytes(
     state: &AppState,
     path: &str,
 ) -> AppResult<Vec<u8>> {
-    let cfg = state.config();
+    let _guard = state.inner.smb_lock.lock().await;
+    let app_cfg = state.config();
     let password = state.password()?;
+    let (cfg, path, _) = crate::commands::resolve_remote_path(&app_cfg, path)?;
     let effective =
-        zt_proxy::effective_smb_config(app, &cfg.smb, &cfg.zerotier_network_id).await?;
+        zt_proxy::effective_smb_config(app, &cfg, &app_cfg.zerotier_network_id).await?;
     let client = state.inner.smb.connect(&effective, &password).await?;
-    let len = state.inner.smb.file_len(&client, "", path).await?;
+    let len = state.inner.smb.file_len(&client, "", &path).await?;
+    log::info!("Preview: read {path} size={len}");
     if len > MAX_ARCHIVE_BYTES {
-        return Err(AppError::msg("Файл больше 512 МБ — предпросмотр недоступен"));
+        return Err(AppError::msg(format!(
+            "Файл больше {} МБ — предпросмотр недоступен. Скачайте его для просмотра.",
+            MAX_ARCHIVE_BYTES / (1024 * 1024)
+        )));
     }
-    state
+    let read = state
         .inner
         .smb
-        .read_range(&client, "", path, 0, len as usize)
+        .read_range(&client, "", &path, 0, len as usize);
+    let data = tokio::time::timeout(std::time::Duration::from_secs(120), read)
         .await
+        .map_err(|_| AppError::msg("Чтение файла с NAS заняло больше 2 минут"))??;
+    log::info!("Preview: read complete {path} bytes={}", data.len());
+    Ok(data)
+}
+
+async fn archive_task<T, F>(label: &str, task: F) -> AppResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> AppResult<T> + Send + 'static,
+{
+    match tokio::time::timeout(ARCHIVE_PARSE_TIMEOUT, tokio::task::spawn_blocking(task)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(AppError::msg(format!("{label}: {error}"))),
+        Err(_) => Err(AppError::msg(format!(
+            "{label}: обработка заняла больше {} секунд",
+            ARCHIVE_PARSE_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 fn xml_to_text(xml: &str) -> String {
@@ -236,8 +262,22 @@ fn open_zip_entry(bytes: Vec<u8>, index: usize) -> AppResult<Vec<u8>> {
     let mut file = archive
         .by_index(index)
         .map_err(|error| AppError::msg(error.to_string()))?;
+    if file.size() > MAX_ARCHIVE_ENTRY_BYTES as u64 {
+        return Err(AppError::msg(format!(
+            "Файл в архиве больше {} МБ",
+            MAX_ARCHIVE_ENTRY_BYTES / (1024 * 1024)
+        )));
+    }
     let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
+    file.by_ref()
+        .take(MAX_ARCHIVE_ENTRY_BYTES as u64 + 1)
+        .read_to_end(&mut data)?;
+    if data.len() > MAX_ARCHIVE_ENTRY_BYTES {
+        return Err(AppError::msg(format!(
+            "Файл в архиве больше {} МБ",
+            MAX_ARCHIVE_ENTRY_BYTES / (1024 * 1024)
+        )));
+    }
     Ok(data)
 }
 
@@ -259,15 +299,51 @@ fn list_zip(bytes: Vec<u8>) -> AppResult<Vec<ArchiveEntry>> {
     Ok(entries)
 }
 
+struct LimitedVec {
+    data: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for LimitedVec {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.data.len().saturating_add(buffer.len()) > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "archive entry is too large",
+            ));
+        }
+        self.data.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn open_rar_entry(bytes: Vec<u8>, index: usize) -> AppResult<Vec<u8>> {
     let mut archive =
         RarArchive::open(Cursor::new(bytes)).map_err(|error| AppError::msg(error.to_string()))?;
-    let mut data = Vec::new();
-    archive
+    let entry = archive
         .by_index(index)
-        .and_then(|entry| entry.copy_to(&mut data))
         .map_err(|error| AppError::msg(error.to_string()))?;
-    Ok(data)
+    if entry
+        .size()
+        .is_some_and(|size| size > MAX_ARCHIVE_ENTRY_BYTES as u64)
+    {
+        return Err(AppError::msg(format!(
+            "Файл в архиве больше {} МБ",
+            MAX_ARCHIVE_ENTRY_BYTES / (1024 * 1024)
+        )));
+    }
+    let mut output = LimitedVec {
+        data: Vec::new(),
+        limit: MAX_ARCHIVE_ENTRY_BYTES,
+    };
+    entry
+        .copy_to(&mut output)
+        .map_err(|error| AppError::msg(error.to_string()))?;
+    Ok(output.data)
 }
 
 fn list_rar(bytes: Vec<u8>) -> AppResult<Vec<ArchiveEntry>> {
@@ -432,7 +508,10 @@ pub async fn preview_document(
 ) -> AppResult<DocumentPreview> {
     let bytes = read_remote_bytes(&app, &state, &path).await?;
     let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-    preview_office_with_zip(&name, bytes)
+    archive_task("Предпросмотр документа", move || {
+        preview_office_with_zip(&name, bytes)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -443,11 +522,15 @@ pub async fn archive_list(
 ) -> AppResult<Vec<ArchiveEntry>> {
     let kind = archive_kind(&path)
         .ok_or_else(|| AppError::msg("Поддерживаются архивы ZIP и RAR"))?;
+    log::info!("Archive: list start {path}");
     let bytes = read_remote_bytes(&app, &state, &path).await?;
-    match kind {
+    let entries = archive_task("Список архива", move || match kind {
         ArchiveKind::Zip => list_zip(bytes),
         ArchiveKind::Rar => list_rar(bytes),
-    }
+    })
+    .await?;
+    log::info!("Archive: list done {path} entries={}", entries.len());
+    Ok(entries)
 }
 
 #[tauri::command]
@@ -459,11 +542,14 @@ pub async fn archive_read(
 ) -> AppResult<tauri::ipc::Response> {
     let kind = archive_kind(&path)
         .ok_or_else(|| AppError::msg("Поддерживаются архивы ZIP и RAR"))?;
+    log::info!("Archive: read entry start {path} index={index}");
     let bytes = read_remote_bytes(&app, &state, &path).await?;
-    let data = match kind {
-        ArchiveKind::Zip => open_zip_entry(bytes, index)?,
-        ArchiveKind::Rar => open_rar_entry(bytes, index)?,
-    };
+    let data = archive_task("Чтение файла из архива", move || match kind {
+        ArchiveKind::Zip => open_zip_entry(bytes, index),
+        ArchiveKind::Rar => open_rar_entry(bytes, index),
+    })
+    .await?;
+    log::info!("Archive: read entry done {path} index={index} bytes={}", data.len());
     Ok(tauri::ipc::Response::new(data))
 }
 
@@ -476,13 +562,17 @@ pub async fn archive_preview_entry(
 ) -> AppResult<DocumentPreview> {
     let kind = archive_kind(&path)
         .ok_or_else(|| AppError::msg("Поддерживаются архивы ZIP и RAR"))?;
+    log::info!("Archive: preview entry start {path} index={index}");
     let bytes = read_remote_bytes(&app, &state, &path).await?;
-    let name = archive_entry_name(kind, &bytes, index)?;
-    let data = match kind {
-        ArchiveKind::Zip => open_zip_entry(bytes, index)?,
-        ArchiveKind::Rar => open_rar_entry(bytes, index)?,
-    };
-    preview_office_with_zip(&name, data)
+    archive_task("Предпросмотр файла из архива", move || {
+        let name = archive_entry_name(kind, &bytes, index)?;
+        let data = match kind {
+            ArchiveKind::Zip => open_zip_entry(bytes, index)?,
+            ArchiveKind::Rar => open_rar_entry(bytes, index)?,
+        };
+        preview_office_with_zip(&name, data)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -494,13 +584,38 @@ pub async fn archive_save_entry(
 ) -> AppResult<String> {
     let kind = archive_kind(&path)
         .ok_or_else(|| AppError::msg("Поддерживаются архивы ZIP и RAR"))?;
+    log::info!("Archive: save entry start {path} index={index}");
     let bytes = read_remote_bytes(&app, &state, &path).await?;
-    let name = archive_entry_name(kind, &bytes, index)?;
-    let data = match kind {
-        ArchiveKind::Zip => open_zip_entry(bytes, index)?,
-        ArchiveKind::Rar => open_rar_entry(bytes, index)?,
-    };
-    save_bytes_to_downloads(&app, &state, &name, &data).await
+    let (name, data) = archive_task("Извлечение файла из архива", move || {
+        let name = archive_entry_name(kind, &bytes, index)?;
+        let data = match kind {
+            ArchiveKind::Zip => open_zip_entry(bytes, index)?,
+            ArchiveKind::Rar => open_rar_entry(bytes, index)?,
+        };
+        Ok((name, data))
+    })
+    .await?;
+    let transfer_id = state
+        .inner
+        .transfers
+        .begin_many(&app, "download", vec![(name.clone(), data.len() as u64)])
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    state.inner.transfers.start(&app, &transfer_id);
+    state
+        .inner
+        .transfers
+        .progress(&app, &transfer_id, 0, data.len() as u64);
+    let saved = save_bytes_to_downloads(&app, &state, &name, &data).await;
+    match &saved {
+        Ok(_) => state.inner.transfers.finish(&app, &transfer_id, None),
+        Err(error) => state
+            .inner
+            .transfers
+            .finish(&app, &transfer_id, Some(error.to_string())),
+    }
+    saved
 }
 
 #[tauri::command]
@@ -512,12 +627,17 @@ pub async fn archive_open_entry(
 ) -> AppResult<String> {
     let kind = archive_kind(&path)
         .ok_or_else(|| AppError::msg("Поддерживаются архивы ZIP и RAR"))?;
+    log::info!("Archive: open entry start {path} index={index}");
     let bytes = read_remote_bytes(&app, &state, &path).await?;
-    let name = archive_entry_name(kind, &bytes, index)?;
-    let data = match kind {
-        ArchiveKind::Zip => open_zip_entry(bytes, index)?,
-        ArchiveKind::Rar => open_rar_entry(bytes, index)?,
-    };
+    let (name, data) = archive_task("Открытие файла из архива", move || {
+        let name = archive_entry_name(kind, &bytes, index)?;
+        let data = match kind {
+            ArchiveKind::Zip => open_zip_entry(bytes, index)?,
+            ArchiveKind::Rar => open_rar_entry(bytes, index)?,
+        };
+        Ok((name, data))
+    })
+    .await?;
     open_bytes_in_system(&app, &state, &name, &data).await
 }
 
@@ -528,6 +648,7 @@ pub async fn save_external_file(
     remote_path: String,
     local_path: String,
 ) -> AppResult<String> {
+    let _guard = state.inner.smb_lock.lock().await;
     let preview_root = preview_root(&app, &state)?;
     let local = PathBuf::from(&local_path);
     if !local.starts_with(&preview_root) {
@@ -536,15 +657,16 @@ pub async fn save_external_file(
     if !local.is_file() {
         return Err(AppError::msg("Временный файл не найден"));
     }
-    let cfg = state.config();
+    let app_cfg = state.config();
     let password = state.password()?;
+    let (cfg, remote_path, _) = crate::commands::resolve_remote_path(&app_cfg, &remote_path)?;
     let effective =
-        zt_proxy::effective_smb_config(&app, &cfg.smb, &cfg.zerotier_network_id).await?;
+        zt_proxy::effective_smb_config(&app, &cfg, &app_cfg.zerotier_network_id).await?;
     let client = state.inner.smb.connect(&effective, &password).await?;
     let written = state
         .inner
         .smb
-        .upload_file(&client, &normalize_rel(&remote_path), &local)
+        .upload_file(&client, &remote_path, &local)
         .await?;
     state.inner.smb.reset().await;
     Ok(format!(

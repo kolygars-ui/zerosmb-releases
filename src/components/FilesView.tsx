@@ -13,6 +13,9 @@ interface Props {
   android: boolean;
   viewMode: "list" | "details";
   onPathChange: (path: string) => void;
+  share: string;
+  onSelectShare: (share: string) => void;
+  onClearShare: () => void;
   onExternalEdit: (session: ExternalEditSession) => void;
   externalDocuments: boolean;
 }
@@ -59,6 +62,9 @@ export default function FilesView({
   android,
   viewMode,
   onPathChange,
+  share,
+  onSelectShare,
+  onClearShare,
   onExternalEdit,
   externalDocuments,
 }: Props) {
@@ -78,7 +84,9 @@ export default function FilesView({
   const [sort, setSort] = useState<SortMode>("date-desc");
   const [folderBusy, setFolderBusy] = useState(false);
   const [folderProgress, setFolderProgress] = useState<SyncProgress | null>(null);
+  const [singleDownloadPercent, setSingleDownloadPercent] = useState<number | null>(null);
   const [folderResult, setFolderResult] = useState<DownloadResult | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<SyncProgress | null>(null);
 
   const load = useCallback(async (nextPath: string) => {
     setLoading(true);
@@ -92,7 +100,7 @@ export default function FilesView({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [share]);
 
   useEffect(() => {
     void load("");
@@ -138,6 +146,10 @@ export default function FilesView({
   const segments = path.split("/").filter(Boolean);
 
   const openEntry = (entry: FileEntry) => {
+    if (entry.isShare) {
+      onSelectShare(entry.name);
+      return;
+    }
     if (selectMode) {
       setSelected((current) => {
         const next = new Set(current);
@@ -215,6 +227,7 @@ export default function FilesView({
     setMessage("");
     setFolderResult(null);
     setFolderProgress(null);
+    setSingleDownloadPercent(null);
     try {
       const result = await api.downloadGallery(path, "rename", setFolderProgress);
       setFolderResult(result);
@@ -224,12 +237,16 @@ export default function FilesView({
       setFolderBusy(false);
     }
   };
-  const upload = async () => {
+  const upload = async (folder = false) => {
     setActionBusy(true);
+    setUploadProgress(null);
+    setSingleDownloadPercent(null);
     setError("");
     setMessage("");
     try {
-      const result = await api.uploadFiles(path);
+      const result = folder
+        ? await api.uploadFolder(path, setUploadProgress)
+        : await api.uploadFiles(path, setUploadProgress);
       setMessage(
         `Загружено: ${result.uploaded}, ошибок: ${result.failed}${
           result.errors.length ? `\n${result.errors.slice(0, 5).join("\n")}` : ""
@@ -245,14 +262,46 @@ export default function FilesView({
 
   const download = async (entry: FileEntry) => {
     setActionBusy(true);
+    setSingleDownloadPercent(0);
+    setFolderProgress({
+      phase: "download",
+      current: 0,
+      total: entry.size || 1,
+      file: entry.name,
+      bytes: 0,
+      skipped: 0,
+      failed: 0,
+      message: null,
+    });
     setError("");
     setMessage("");
+    const handleProgress = (progress: SyncProgress) => {
+      const total = entry.size || progress.total;
+      const sent = progress.bytes || progress.current;
+      if (total > 0) {
+        setSingleDownloadPercent(Math.min(100, Math.round((sent / total) * 100)));
+      }
+      setFolderProgress({ ...progress, current: sent, total: total || 1 });
+    };
     try {
       const saved = await api.downloadFile(
         entry.path,
         android ? undefined : parentOf(entry.path),
+        undefined,
+        handleProgress,
       );
-      setMessage(`Сохранено: ${saved}`);
+      setSingleDownloadPercent(100);
+      setFolderProgress({
+        phase: "done",
+        current: entry.size,
+        total: entry.size || 1,
+        file: entry.name,
+        bytes: entry.size,
+        skipped: 0,
+        failed: 0,
+        message: null,
+      });
+      setMessage(`Скачано: ${saved}`);
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -355,6 +404,18 @@ export default function FilesView({
             Загрузить файлы
           </button>
           <button
+            className="btn primary"
+            onClick={() => void upload(true)}
+            disabled={actionBusy || loading}
+          >
+            Загрузить папку
+          </button>
+          {share && (
+            <button className="btn" onClick={onClearShare} disabled={actionBusy || loading}>
+              Все шеры
+            </button>
+          )}
+          <button
             className="btn"
             onClick={() => void load(path)}
             disabled={loading || actionBusy}
@@ -367,13 +428,20 @@ export default function FilesView({
             <div className="progress">
               <div
                 style={{
-                  width: `${folderProgress.total ? (folderProgress.current / folderProgress.total) * 100 : 0}%`,
+                  width: `${
+                    singleDownloadPercent ??
+                    (folderProgress.total
+                      ? (folderProgress.current / folderProgress.total) * 100
+                      : 0)
+                  }%`,
                 }}
               />
             </div>
             <div className="row small muted" style={{ marginTop: 5 }}>
               <span>
-                {folderProgress.current}/{folderProgress.total}
+                {singleDownloadPercent !== null
+                  ? `${singleDownloadPercent}%`
+                  : `${folderProgress.current}/${folderProgress.total}`}
               </span>
               <span className="spacer" />
               <span>{formatBytes(folderProgress.bytes)}</span>
@@ -390,16 +458,37 @@ export default function FilesView({
             {folderResult.destination}
           </div>
         )}
-        <div className="breadcrumbs" style={{ marginTop: 10 }}>
-          <button onClick={() => void load("")}>Корень</button>
-          {segments.map((segment, index) => {
-            const target = segments.slice(0, index + 1).join("/");
-            return (
-              <span key={target}>
-                / <button onClick={() => void load(target)}>{segment}</button>
+        {uploadProgress && (
+          <div style={{ marginTop: 10 }}>
+            <div className="progress">
+              <div
+                style={{
+                  width: `${uploadProgress.total ? (uploadProgress.current / uploadProgress.total) * 100 : 0}%`,
+                }}
+              />
+            </div>
+            <div className="row small muted" style={{ marginTop: 5 }}>
+              <span>
+                {uploadProgress.phase === "done"
+                  ? "Загрузка завершена"
+                  : `${uploadProgress.current}/${uploadProgress.total}`}
               </span>
-            );
-          })}
+              <span className="spacer" />
+              <span>{formatBytes(uploadProgress.bytes)}</span>
+            </div>
+            {uploadProgress.file && (
+              <div className="hint mono">{uploadProgress.file}</div>
+            )}
+          </div>
+        )}
+        <div className="field" style={{ marginTop: 10 }}>
+          <label>Текущая папка на NAS</label>
+          <input
+            value={["Корень", ...(share ? [share] : []), ...segments].join(" / ")}
+            readOnly
+            spellCheck={false}
+            className="mono path-display"
+          />
         </div>
       </div>
 

@@ -1,4 +1,4 @@
-﻿#![cfg(not(target_os = "android"))]
+#![cfg(not(target_os = "android"))]
 
 use crate::error::{AppError, AppResult};
 use crate::zerotier::{ZtNetwork, ZtStatus};
@@ -54,6 +54,34 @@ struct ProxyState {
     host: String,
     target_port: u16,
     stop: Arc<AtomicBool>,
+    accept: Option<std::thread::JoinHandle<()>>,
+    bridges: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    fds: Arc<Mutex<Vec<c_int>>>,
+}
+
+impl ProxyState {
+    fn shutdown(self) {
+        log::info!("ZeroTier proxy: shutdown 127.0.0.1:{}", self.port);
+        self.stop.store(true, Ordering::SeqCst);
+        if let Ok(fds) = self.fds.lock() {
+            for fd in fds.iter() {
+                unsafe {
+                    zts_bsd_shutdown(*fd, 2);
+                }
+            }
+        }
+        if let Some(accept) = self.accept {
+            let _ = accept.join();
+        }
+        let bridges = self
+            .bridges
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default();
+        for bridge in bridges {
+            let _ = bridge.join();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -98,6 +126,7 @@ impl ZtNode {
         require_ready: bool,
     ) -> AppResult<ZtStatus> {
         let network = parse_network_id(network_hex)?;
+        log::info!("ZeroTier: ensure network {network:016x}, require_ready={require_ready}");
         let roots_key = roots.map(|path| path.to_string_lossy().to_string());
         let mut state = self
             .state
@@ -111,6 +140,7 @@ impl ZtNode {
                 ));
             }
             self.stop_proxy();
+            log::warn!("ZeroTier: stopping node because roots changed");
             unsafe {
                 zts_node_stop();
             }
@@ -126,6 +156,7 @@ impl ZtNode {
         }
 
         if state.started && unsafe { zts_node_is_online() } != 1 {
+            log::warn!("ZeroTier: node offline, restarting");
             self.stop_proxy();
             unsafe {
                 zts_node_stop();
@@ -149,6 +180,7 @@ impl ZtNode {
         }
 
         if !state.started {
+            log::info!("ZeroTier: starting node, storage={}", storage.display());
             std::fs::create_dir_all(storage)?;
             let storage_c = CString::new(storage.to_string_lossy().as_bytes().to_vec())
                 .map_err(|_| AppError::msg("Некорректный путь хранилища ZeroTier"))?;
@@ -186,6 +218,7 @@ impl ZtNode {
             }
             state.started = true;
             state.roots = roots_key;
+            log::info!("ZeroTier: node started");
         }
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -199,6 +232,7 @@ impl ZtNode {
         }
 
         if state.network != network {
+            log::info!("ZeroTier: joining network {network:016x}");
             let result = unsafe { zts_net_join(network) };
             if result < 0 {
                 return Err(AppError::msg(format!("ZeroTier: net_join ({result})")));
@@ -221,10 +255,12 @@ impl ZtNode {
 
         state.node_id = unsafe { zts_node_get_id() };
         state.ipv4 = read_ipv4(network);
+        log::info!("ZeroTier: ready, ip={}", state.ipv4);
         Ok(status_from(&state))
     }
 
     pub fn leave(&self) -> AppResult<ZtStatus> {
+        log::info!("ZeroTier: leave");
         self.stop_proxy();
         let mut state = self
             .state
@@ -241,6 +277,7 @@ impl ZtNode {
     }
 
     pub fn stop(&self) {
+        log::info!("ZeroTier: stop");
         self.stop_proxy();
         if let Ok(mut state) = self.state.lock() {
             if state.started {
@@ -256,6 +293,7 @@ impl ZtNode {
     }
 
     pub fn start_proxy(&self, host: &str, target_port: u16) -> AppResult<u16> {
+        log::info!("ZeroTier proxy: start to {host}:{target_port}");
         let mut guard = self
             .proxy
             .lock()
@@ -266,28 +304,44 @@ impl ZtNode {
             }
         }
         if let Some(proxy) = guard.take() {
-            proxy.stop.store(true, Ordering::SeqCst);
+            proxy.shutdown();
         }
 
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = stop.clone();
+        let bridges: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let fds: Arc<Mutex<Vec<c_int>>> = Arc::new(Mutex::new(Vec::new()));
+        let accept_stop = stop.clone();
+        let accept_bridges = bridges.clone();
+        let accept_fds = fds.clone();
         let target_host = host.to_string();
-        std::thread::spawn(move || {
-            while !stop_thread.load(Ordering::SeqCst) {
+        let accept = std::thread::spawn(move || {
+            while !accept_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((client, _)) => {
+                        if accept_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
                         let _ = client.set_nonblocking(false);
                         let host = target_host.clone();
-                        std::thread::spawn(move || bridge_tcp(client, &host, target_port));
+                        let stop = accept_stop.clone();
+                        let fds = accept_fds.clone();
+                        let bridge = std::thread::spawn(move || {
+                            bridge_tcp(client, &host, target_port, stop, fds)
+                        });
+                        if let Ok(mut handles) = accept_bridges.lock() {
+                            handles.retain(|handle| !handle.is_finished());
+                            handles.push(bridge);
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(40));
                     }
                     Err(_) => {
-                        if stop_thread.load(Ordering::SeqCst) {
+                        if accept_stop.load(Ordering::SeqCst) {
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(20));
@@ -295,20 +349,27 @@ impl ZtNode {
                 }
             }
         });
+        log::info!("ZeroTier proxy: listening on 127.0.0.1:{port}");
         *guard = Some(ProxyState {
             port,
             host: host.to_string(),
             target_port,
             stop,
+            accept: Some(accept),
+            bridges,
+            fds,
         });
         Ok(port)
     }
 
     fn stop_proxy(&self) {
-        if let Ok(mut guard) = self.proxy.lock() {
-            if let Some(proxy) = guard.take() {
-                proxy.stop.store(true, Ordering::SeqCst);
-            }
+        let proxy = self
+            .proxy
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(proxy) = proxy {
+            proxy.shutdown();
         }
     }
 }
@@ -387,14 +448,38 @@ fn status_from(state: &NodeState) -> ZtStatus {
     }
 }
 
-fn bridge_tcp(client: TcpStream, host: &str, port: u16) {
+fn unregister_fd(fds: &Arc<Mutex<Vec<c_int>>>, fd: c_int) {
+    if let Ok(mut guard) = fds.lock() {
+        guard.retain(|value| *value != fd);
+    }
+}
+
+fn bridge_tcp(
+    client: TcpStream,
+    host: &str,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    fds: Arc<Mutex<Vec<c_int>>>,
+) {
+    log::info!("ZeroTier proxy: bridge open to {host}:{port}");
     let fd = unsafe { zts_bsd_socket(ZTS_AF_INET, ZTS_SOCK_STREAM, 0) };
     if fd < 0 {
+        log::warn!("ZeroTier proxy: socket failed");
         return;
+    }
+    if stop.load(Ordering::SeqCst) {
+        unsafe {
+            zts_bsd_close(fd);
+        }
+        return;
+    }
+    if let Ok(mut guard) = fds.lock() {
+        guard.push(fd);
     }
     let host_c = match CString::new(host) {
         Ok(value) => value,
         Err(_) => {
+            unregister_fd(&fds, fd);
             unsafe {
                 zts_bsd_close(fd);
             }
@@ -403,11 +488,21 @@ fn bridge_tcp(client: TcpStream, host: &str, port: u16) {
     };
     let result = unsafe { zts_connect(fd, host_c.as_ptr(), port, 15000) };
     if result < 0 {
+        log::warn!("ZeroTier proxy: connect to {host}:{port} failed ({result})");
+        unregister_fd(&fds, fd);
         unsafe {
             zts_bsd_close(fd);
         }
         return;
     }
+    if stop.load(Ordering::SeqCst) {
+        unregister_fd(&fds, fd);
+        unsafe {
+            zts_bsd_close(fd);
+        }
+        return;
+    }
+    log::info!("ZeroTier proxy: connected to {host}:{port}");
     unsafe {
         zts_set_blocking(fd, 1);
         zts_set_no_delay(fd, 1);
@@ -416,6 +511,7 @@ fn bridge_tcp(client: TcpStream, host: &str, port: u16) {
     let mut client_write = match client.try_clone() {
         Ok(value) => value,
         Err(_) => {
+            unregister_fd(&fds, fd);
             unsafe {
                 zts_bsd_close(fd);
             }
@@ -423,22 +519,30 @@ fn bridge_tcp(client: TcpStream, host: &str, port: u16) {
         }
     };
     let mut client_read = client;
+    let stopped = Arc::new(AtomicBool::new(false));
+    let writer_stopped = stopped.clone();
     let writer = std::thread::spawn(move || {
         local_to_zt(&mut client_write, fd);
-        unsafe {
-            zts_bsd_shutdown(fd, 2);
+        if !writer_stopped.swap(true, Ordering::SeqCst) {
+            unsafe {
+                zts_bsd_shutdown(fd, 2);
+            }
         }
         let _ = client_write.shutdown(std::net::Shutdown::Both);
     });
     zt_to_local(fd, &mut client_read);
     let _ = client_read.shutdown(std::net::Shutdown::Both);
-    unsafe {
-        zts_bsd_shutdown(fd, 2);
+    if !stopped.swap(true, Ordering::SeqCst) {
+        unsafe {
+            zts_bsd_shutdown(fd, 2);
+        }
     }
     let _ = writer.join();
+    unregister_fd(&fds, fd);
     unsafe {
         zts_bsd_close(fd);
     }
+    log::info!("ZeroTier proxy: bridge closed");
 }
 
 fn local_to_zt(client: &mut TcpStream, fd: c_int) {

@@ -253,13 +253,15 @@ pub async fn run_gallery(
     conflict_policy: &str,
     channel: &Channel<SyncProgress>,
 ) -> AppResult<SyncSummary> {
-    let cfg = state.config();
+    let _guard = state.inner.smb_lock.lock().await;
+    let app_cfg = state.config();
     let password = state.password()?;
+    let (cfg, remote_path, _) = crate::commands::resolve_remote_path(&app_cfg, remote_path)?;
     let effective =
-        zt_proxy::effective_smb_config(app, &cfg.smb, &cfg.zerotier_network_id).await?;
+        zt_proxy::effective_smb_config(app, &cfg, &app_cfg.zerotier_network_id).await?;
     let client = state.inner.smb.connect(&effective, &password).await?;
-    let base = cfg.smb.normalized_base();
-    let remote_base = join_rel(&base, remote_path);
+    let base = cfg.normalized_base();
+    let remote_base = join_rel(&base, &remote_path);
     state
         .inner
         .smb
@@ -268,7 +270,7 @@ pub async fn run_gallery(
     let mut remote = state
         .inner
         .smb
-        .list_tree(&client, &base, remote_path)
+        .list_tree(&client, &base, &remote_path)
         .await
         .unwrap_or_default();
 

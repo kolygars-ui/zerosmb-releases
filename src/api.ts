@@ -26,6 +26,7 @@ import type {
   WireGuardStatus,
   UploadResult,
   DownloadResult,
+  ZerotierMode,
   ZtStatus,
 } from "./types";
 
@@ -40,32 +41,78 @@ export const api = {
     password: string,
     zerotierNetworkId?: string,
     connectionMode?: ConnectionMode,
-  ) => invoke<void>("test_connection", { smb, password, zerotierNetworkId, connectionMode }),
+    zerotierMode?: ZerotierMode,
+  ) =>
+    invoke<void>("test_connection", {
+      smb,
+      password,
+      zerotierNetworkId,
+      connectionMode,
+      zerotierMode,
+    }),
   testCurrentConnection: () => invoke<void>("test_current_connection"),
   testConnectionSaved: (
     smb: SmbConfig,
     zerotierNetworkId?: string,
     connectionMode?: ConnectionMode,
-  ) => invoke<void>("test_connection_saved", { smb, zerotierNetworkId, connectionMode }),
+    zerotierMode?: ZerotierMode,
+  ) =>
+    invoke<void>("test_connection_saved", {
+      smb,
+      zerotierNetworkId,
+      connectionMode,
+      zerotierMode,
+    }),
   saveSetup: (input: SetupInput) => invoke<PublicConfig>("save_setup", { input }),
   saveSettings: (input: SettingsInput) =>
     invoke<PublicConfig>("save_settings", { input }),
   pickLocalFolder: () => invoke<string | null>("pick_local_folder"),
   smbList: (path: string) => invoke<FileEntry[]>("smb_list", { path }),
+  selectSmbShare: (share: string) => invoke<PublicConfig>("select_smb_share", { share }),
+  clearSmbShare: () => invoke<PublicConfig>("clear_smb_share"),
+  sendErrorLog: (remoteDir: string) =>
+    invoke<string>("send_error_log", { remoteDir }),
   deletePaths: (paths: string[]) => invoke<DeleteResult>("delete_paths", { paths }),
   createFolder: (path: string) => invoke<void>("create_folder", { path }),
-  uploadFiles: (remoteDir: string) =>
-    invoke<UploadResult>("upload_files", { remoteDir }),
+  uploadFiles: (
+    remoteDir: string,
+    onProgress: (progress: SyncProgress) => void,
+    mediaOnly = false,
+  ) => {
+    const channel = new Channel<SyncProgress>();
+    channel.onmessage = onProgress;
+    return invoke<UploadResult>("upload_files", {
+      remoteDir,
+      mediaOnly,
+      onProgress: channel,
+    });
+  },
+  uploadFolder: (
+    remoteDir: string,
+    onProgress: (progress: SyncProgress) => void,
+  ) => {
+    const channel = new Channel<SyncProgress>();
+    channel.onmessage = onProgress;
+    return invoke<UploadResult>("upload_folder", {
+      remoteDir,
+      onProgress: channel,
+    });
+  },
   downloadFile: (
     path: string,
     relativeDir?: string,
     conflictPolicy?: "skip" | "rename",
-  ) =>
-    invoke<string>("download_file", {
+    onProgress?: (progress: SyncProgress) => void,
+  ) => {
+    const channel = new Channel<SyncProgress>();
+    if (onProgress) channel.onmessage = onProgress;
+    return invoke<string>("download_file", {
       path,
       relativeDir,
       conflictPolicy,
-    }),
+      onProgress: channel,
+    });
+  },
   readTextFile: (path: string) => invoke<string>("read_text_file", { path }),
   readFileBytes: (path: string) => invoke<ArrayBuffer>("read_file_bytes", { path }),
   previewDocument: (path: string) =>
@@ -167,18 +214,24 @@ export const api = {
     channel.onmessage = onProgress;
     return invoke<SyncSummary>("sync_run_job", { id, onProgress: channel });
   },
-  ztStatus: () => invoke<ZtStatus>("zt_status"),
-  ztJoin: (networkId: string) => invoke<ZtStatus>("zt_join", { networkId }),
-  ztLeave: (networkId: string) => invoke<ZtStatus>("zt_leave", { networkId }),
+  ztStatus: (zerotierMode?: ZerotierMode) =>
+    invoke<ZtStatus>("zt_status", { zerotierMode }),
+  ztJoin: (networkId: string, zerotierMode?: ZerotierMode) =>
+    invoke<ZtStatus>("zt_join", { networkId, zerotierMode }),
+  ztLeave: (networkId: string, zerotierMode?: ZerotierMode) =>
+    invoke<ZtStatus>("zt_leave", { networkId, zerotierMode }),
   ztOpenAndroid: (networkId: string) =>
     invoke<{ installed: boolean; opened: boolean; copied: boolean }>(
       "zt_open_android",
       { networkId },
     ),
   ztOpenHelp: () => invoke<void>("zt_open_help"),
-  getPlanet: () => invoke<PlanetInfo>("get_planet"),
-  pickPlanet: () => invoke<PlanetInfo>("pick_planet"),
-  clearPlanet: () => invoke<PlanetInfo>("clear_planet"),
+  getPlanet: (zerotierMode?: ZerotierMode) =>
+    invoke<PlanetInfo>("get_planet", { zerotierMode }),
+  pickPlanet: (zerotierMode?: ZerotierMode) =>
+    invoke<PlanetInfo>("pick_planet", { zerotierMode }),
+  clearPlanet: (zerotierMode?: ZerotierMode) =>
+    invoke<PlanetInfo>("clear_planet", { zerotierMode }),
   checkUpdate: (repo?: string) => invoke<UpdateInfo>("check_update", { repo }),
   installUpdate: (url: string, filename: string) =>
     invoke<string>("install_update", { url, filename }),

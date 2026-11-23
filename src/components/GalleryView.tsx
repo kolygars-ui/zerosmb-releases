@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+﻿import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   formatBytes,
@@ -217,6 +217,7 @@ export default function GalleryView({
   const [downloadProgress, setDownloadProgress] = useState<SyncProgress | null>(null);
   const [downloadSummary, setDownloadSummary] = useState<DownloadResult | null>(null);
   const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<SyncProgress | null>(null);
   const [downloadConflict, setDownloadConflict] = useState<"skip" | "rename">("skip");
   const [nasSelectMode, setNasSelectMode] = useState(false);
   const [selectedNas, setSelectedNas] = useState<Set<string>>(new Set());
@@ -441,11 +442,12 @@ export default function GalleryView({
 
   const uploadToGallery = async () => {
     setUploadBusy(true);
+    setUploadProgress(null);
     setError("");
     setItemNote("");
     try {
       await api.ensureGalleryFolder(nasPath);
-      const result = await api.uploadFiles(nasPath);
+      const result = await api.uploadFiles(nasPath, setUploadProgress, true);
       setItemNote(
         `Загружено: ${result.uploaded}, ошибок: ${result.failed}${
           result.errors.length ? `\n${result.errors.slice(0, 5).join("\n")}` : ""
@@ -556,7 +558,7 @@ export default function GalleryView({
               Выбрать с телефона
             </button>
           )}
-          {mode === "nas" && (
+          {mode === "nas" && !android && (
             <button
               className="btn primary"
               onClick={() => void uploadToGallery()}
@@ -598,6 +600,29 @@ export default function GalleryView({
         {itemNote && (
           <div className="success" style={{ marginTop: 12, whiteSpace: "pre-wrap" }}>
             {itemNote}
+          </div>
+        )}
+        {uploadProgress && (
+          <div style={{ marginTop: 12 }}>
+            <div className="progress">
+              <div
+                style={{
+                  width: `${uploadProgress.total ? (uploadProgress.current / uploadProgress.total) * 100 : 0}%`,
+                }}
+              />
+            </div>
+            <div className="row small muted" style={{ marginTop: 6 }}>
+              <span>
+                {uploadProgress.phase === "done"
+                  ? "Загрузка завершена"
+                  : `${uploadProgress.current}/${uploadProgress.total}`}
+              </span>
+              <span className="spacer" />
+              <span>{formatBytes(uploadProgress.bytes)}</span>
+            </div>
+            {uploadProgress.file && (
+              <div className="hint mono">{uploadProgress.file}</div>
+            )}
           </div>
         )}
         {downloadProgress && (
@@ -721,7 +746,7 @@ export default function GalleryView({
         <>
           <div className="card">
             <div className="field">
-              <label>Папка галереи на NAS</label>
+              <label>Текущая папка на NAS</label>
               <input
                 value={pathInput}
                 onChange={(event) => setPathInput(event.target.value)}

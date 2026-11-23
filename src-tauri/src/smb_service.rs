@@ -1,12 +1,17 @@
-use crate::config::SmbConfig;
+﻿use crate::config::SmbConfig;
 use crate::error::{AppError, AppResult};
 use futures_util::StreamExt;
 use serde::Serialize;
 use smb::{
     binrw_util::file_time::FileTime, Client, ClientConfig, CreateDisposition, CreateOptions,
     DirAccessMask, Directory, FileAccessMask, FileAttributes, FileBasicInformation, FileCreateArgs,
-    FileDispositionInformation, FileIdBothDirectoryInformation, GetLen, ReadAt, Resource, UncPath,
-    WriteAt,
+    FileDispositionInformation, FileIdBothDirectoryInformation, GetLen, Guid, IoctlBuffer,
+    PipeTransceiveRequest, ReadAt, Resource, UncPath, WriteAt,
+};
+use smb_rpc::pdu::{
+    DcRpcCoPktBind, DcRpcCoPktBindContextElement, DceRpcCoPktBindAckDefResult, DcRpcCoPktRequest,
+    DcRpcCoPktResponseContent, DceRpcCoPktFlags, DceRpcCoRequestPkt, DceRpcCoResponsePkt,
+    DceRpcSyntaxId,
 };
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
@@ -21,6 +26,7 @@ pub struct FileEntry {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
+    pub is_share: bool,
     pub size: u64,
     pub modified: i64,
     pub extension: String,
@@ -58,6 +64,9 @@ impl SmbService {
 
     pub async fn connect(&self, cfg: &SmbConfig, password: &str) -> AppResult<Arc<Client>> {
         cfg.validate()?;
+        if cfg.share.trim().is_empty() {
+            return Err(AppError::msg("Выберите SMB-ресурс (share)"));
+        }
         let key = format!(
             "{}|{}|{}|{}|{}",
             cfg.normalized_host(),
@@ -110,8 +119,262 @@ impl SmbService {
             .ok_or_else(|| AppError::msg("SMB-соединение не установлено"))
     }
 
+    pub async fn list_shares(
+        cfg: &SmbConfig,
+        server: &str,
+        password: &str,
+    ) -> AppResult<Vec<FileEntry>> {
+        cfg.validate()?;
+        let mut client_config = ClientConfig::default();
+        client_config.connection.port = Some(cfg.port);
+        let client = Client::new(client_config);
+        let host = cfg.normalized_host();
+        let ipc = UncPath::from_str(&format!(r"\\{}\IPC$", host))?;
+        client
+            .share_connect(&ipc, &cfg.auth_user(), password.to_string())
+            .await
+            .map_err(|error| {
+                AppError::msg(format!(
+                    "SMB {host}:{}. Не удалось подключиться к серверу для списка шеров: {error}",
+                    cfg.port
+                ))
+            })?;
+        let names = match Self::list_shares_ndr32(&client, &host, server).await {
+            Ok(names) => names,
+            Err(ndr32_error) => {
+                log::warn!("NDR32 share enumeration failed: {ndr32_error}; trying NDR64");
+                let shares = client.list_shares(server).await.map_err(|error| {
+                    AppError::msg(format!(
+                        "SMB {host}:{}. �� 㤠���� ������� ᯨ᮪ �஢: {error}",
+                        cfg.port
+                    ))
+                })?;
+                shares
+                    .into_iter()
+                    .filter_map(|share| {
+                        share
+                            .netname
+                            .as_ref()
+                            .map(|name| name.to_string())
+                    })
+                    .collect()
+            }
+        };
+        let mut entries = Vec::new();
+        for name in names {
+            if name.trim().is_empty() || name.eq_ignore_ascii_case("IPC$") {
+                continue;
+            }
+            entries.push(FileEntry {
+                name: name.clone(),
+                path: name,
+                is_dir: true,
+                is_share: true,
+                size: 0,
+                modified: 0,
+                extension: String::new(),
+            });
+        }
+        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        Ok(entries)
+    }
+
+    async fn list_shares_ndr32(
+        client: &Client,
+        host: &str,
+        server: &str,
+    ) -> Result<Vec<String>, String> {
+        let pipe = client
+            .open_pipe(host, "srvsvc")
+            .await
+            .map_err(|error| format!("open srvsvc: {error}"))?;
+        let ndr32 = DceRpcSyntaxId {
+            uuid: "8a885d04-1ceb-11c9-9fe8-08002b104860"
+                .parse::<Guid>()
+                .map_err(|error| format!("NDR32 GUID: {error}"))?,
+            version: 2,
+        };
+        let srvsvc = DceRpcSyntaxId {
+            uuid: "4b324fc8-1670-01d3-1278-5a47bf6ee188"
+                .parse::<Guid>()
+                .map_err(|error| format!("srvsvc GUID: {error}"))?,
+            version: 3,
+        };
+        let bind = DceRpcCoRequestPkt::new(
+            DcRpcCoPktBind {
+                max_xmit_frag: 4280,
+                max_recv_frag: 4280,
+                assoc_group_id: 0,
+                context_elements: vec![DcRpcCoPktBindContextElement {
+                    context_id: 0,
+                    abstract_syntax: srvsvc,
+                    transfer_syntaxes: vec![ndr32.clone()],
+                }],
+            }
+            .into(),
+            2,
+            DceRpcCoPktFlags::new()
+                .with_first_frag(true)
+                .with_last_frag(true),
+            0x10,
+        );
+        let bind_data: Vec<u8> = bind
+            .try_into()
+            .map_err(|error| format!("bind encode: {error}"))?;
+        let response = pipe
+            .fsctl_with_options(
+                PipeTransceiveRequest::from(IoctlBuffer::from(bind_data)),
+                65536,
+            )
+            .await
+            .map_err(|error| format!("bind send: {error}"))?;
+        let response = DceRpcCoResponsePkt::try_from(response.as_ref())
+            .map_err(|error| format!("bind response: {error}"))?;
+        let bind_ack = match response.content() {
+            DcRpcCoPktResponseContent::BindAck(ack) => ack,
+            other => return Err(format!("expected BindAck, got {other:?}")),
+        };
+        let accepted = bind_ack.results.iter().any(|result| {
+            result.result == DceRpcCoPktBindAckDefResult::Acceptance
+                && result.syntax.uuid == ndr32.uuid
+                && result.syntax.version == ndr32.version
+        });
+        if !accepted {
+            return Err(format!("NDR32 bind rejected: {:?}", bind_ack.results));
+        }
+
+        let stub = Self::netr_share_enum0_request(server);
+        let call = DceRpcCoRequestPkt::new(
+            DcRpcCoPktRequest {
+                alloc_hint: 0,
+                context_id: 0,
+                opnum: 0x0f,
+                stub_data: stub,
+            }
+            .into(),
+            3,
+            DceRpcCoPktFlags::new()
+                .with_first_frag(true)
+                .with_last_frag(true),
+            0x10,
+        );
+        let call_data: Vec<u8> = call
+            .try_into()
+            .map_err(|error| format!("share enum encode: {error}"))?;
+        let response = pipe
+            .fsctl_with_options(
+                PipeTransceiveRequest::from(IoctlBuffer::from(call_data)),
+                65536,
+            )
+            .await
+            .map_err(|error| format!("share enum send: {error}"))?;
+        let _ = pipe.close().await;
+        let response = DceRpcCoResponsePkt::try_from(response.as_ref())
+            .map_err(|error| format!("share enum response: {error}"))?;
+        let body = match response.content() {
+            DcRpcCoPktResponseContent::Response(reply) => &reply.stub_data,
+            other => return Err(format!("expected share enum response, got {other:?}")),
+        };
+        Self::parse_share_enum0(body)
+    }
+
+    fn netr_share_enum0_request(server: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(96);
+        let server = server.trim();
+        if server.is_empty() {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        } else {
+            let unc = if server.starts_with("\\\\") {
+                server.to_string()
+            } else {
+                format!("\\\\{server}")
+            };
+            let units: Vec<u16> = unc.encode_utf16().chain(std::iter::once(0)).collect();
+            out.extend_from_slice(&0x4bbau32.to_le_bytes());
+            out.extend_from_slice(&(units.len() as u32).to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&(units.len() as u32).to_le_bytes());
+            for unit in &units {
+                out.extend_from_slice(&unit.to_le_bytes());
+            }
+            while out.len() % 4 != 0 {
+                out.push(0xab);
+            }
+        }
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0x4bacu32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&u32::MAX.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out
+    }
+
+    fn parse_share_enum0(stub: &[u8]) -> Result<Vec<String>, String> {
+        fn u32_at(data: &[u8], offset: usize) -> Option<u32> {
+            let bytes = data.get(offset..offset + 4)?;
+            Some(u32::from_le_bytes(bytes.try_into().ok()?))
+        }
+
+        if u32_at(stub, 0) != Some(0) || u32_at(stub, 4) != Some(0) {
+            return Err("unexpected NetrShareEnum level".to_string());
+        }
+        let entries = u32_at(stub, 12).unwrap_or(0) as usize;
+        if entries == 0 {
+            return Ok(Vec::new());
+        }
+        let max_count = u32_at(stub, 20).unwrap_or(0) as usize;
+        let count = entries.min(max_count);
+        let entries_offset: usize = 24;
+        let mut strings_offset = entries_offset
+            .checked_add(count.saturating_mul(4))
+            .ok_or_else(|| "share array overflow".to_string())?;
+        let mut names = Vec::with_capacity(count);
+        for index in 0..count {
+            let pointer = u32_at(stub, entries_offset + index * 4).unwrap_or(0);
+            if pointer == 0 {
+                continue;
+            }
+            let (name, next) = Self::read_ndr32_string(stub, strings_offset)?;
+            strings_offset = next;
+            names.push(name);
+        }
+        Ok(names)
+    }
+
+    fn read_ndr32_string(stub: &[u8], offset: usize) -> Result<(String, usize), String> {
+        fn u32_at(data: &[u8], offset: usize) -> Option<u32> {
+            let bytes = data.get(offset..offset + 4)?;
+            Some(u32::from_le_bytes(bytes.try_into().ok()?))
+        }
+
+        let actual = u32_at(stub, offset + 8).ok_or_else(|| "short NDR string".to_string())?;
+        let start = offset
+            .checked_add(12)
+            .and_then(|value| value.checked_add(u32_at(stub, offset + 4).unwrap_or(0) as usize))
+            .ok_or_else(|| "NDR string offset overflow".to_string())?;
+        let byte_len = (actual as usize)
+            .checked_mul(2)
+            .ok_or_else(|| "NDR string length overflow".to_string())?;
+        let bytes = stub
+            .get(start..start + byte_len)
+            .ok_or_else(|| "truncated NDR string".to_string())?;
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .take_while(|unit| *unit != 0)
+            .collect();
+        let next = (start + byte_len + 3) & !3;
+        Ok((String::from_utf16_lossy(&units), next))
+    }
+
     pub async fn test_connection(cfg: &SmbConfig, password: &str) -> AppResult<()> {
         cfg.validate()?;
+        if cfg.share.trim().is_empty() {
+            Self::list_shares(cfg, &cfg.normalized_host(), password).await?;
+            return Ok(());
+        }
         let mut client_config = ClientConfig::default();
         client_config.connection.port = Some(cfg.port);
         let client = Client::new(client_config);
@@ -207,6 +470,7 @@ impl SmbService {
                 name,
                 path,
                 is_dir,
+                is_share: false,
                 size: item.end_of_file,
                 modified: modified
                     .duration_since(UNIX_EPOCH)
@@ -289,8 +553,12 @@ impl SmbService {
         let wanted = (length as u64).min(file_len - offset) as usize;
         let mut data = vec![0u8; wanted];
         let mut done = 0usize;
+        const READ_CHUNK: usize = 1024 * 1024;
         while done < wanted {
-            let read = file.read_at(&mut data[done..], offset + done as u64).await?;
+            let take = (wanted - done).min(READ_CHUNK);
+            let read = file
+                .read_at(&mut data[done..done + take], offset + done as u64)
+                .await?;
             if read == 0 {
                 break;
             }
@@ -657,5 +925,29 @@ pub fn file_kind(name: &str) -> &'static str {
         "gif" => "gif",
         "mp4" | "m4v" | "webm" | "mkv" | "mov" | "avi" | "3gp" | "ogv" => "video",
         _ => "file",
+    }
+}
+
+#[cfg(test)]
+mod share_enum_tests {
+    use super::SmbService;
+
+    fn hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn parses_ndr32_level0_response() {
+        let stub = hex(
+            "0000000000000000c4a0000002000000722f0000020000007bbc000006ea0000\
+             0400000000000000040000006e00610073000000060000000000000006000000\
+             6d0065006400690061000000020000000000000000000000",
+        );
+        let names = SmbService::parse_share_enum0(&stub).unwrap();
+        assert_eq!(names, vec!["nas", "media"]);
     }
 }

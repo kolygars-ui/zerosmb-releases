@@ -91,7 +91,7 @@ function PdfViewer({ path }: { path: string }) {
       try {
         const buffer = await api.readFileBytes(path);
         const pdf = await pdfjsLib.getDocument({
-          data: new Uint8Array(buffer),
+          data: new Uint8Array(buffer.slice(0)),
         }).promise;
         documentProxy = pdf;
         if (cancelled) return;

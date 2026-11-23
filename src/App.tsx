@@ -259,6 +259,18 @@ export default function App() {
     });
   };
 
+  const selectShare = async (share: string) => {
+    setConfig(await api.selectSmbShare(share));
+    setFilesPath("");
+    setFilesOpenRequest({ path: "", token: Date.now() });
+  };
+
+  const clearShare = async () => {
+    setConfig(await api.clearSmbShare());
+    setFilesPath("");
+    setFilesOpenRequest({ path: "", token: Date.now() });
+  };
+
   useEffect(() => {
     if (!externalEdit || !config?.externalSaveEnabled) return;
     let disposed = false;
@@ -366,6 +378,18 @@ export default function App() {
       ? Math.min(100, Math.round((aggregateTransferred / aggregateTotal) * 100))
       : 0;
   const showTree = tab === "files" && treeVisible;
+  const galleryShare = config.galleryShare.trim().replace(/^\/+|\/+$/g, "");
+  const joinGalleryPath = (path: string) => {
+    const relative = path.trim().replace(/^\/+|\/+$/g, "");
+    if (!galleryShare) return relative;
+    if (relative.toLowerCase() === galleryShare.toLowerCase()) return galleryShare;
+    if (relative.toLowerCase().startsWith(`${galleryShare.toLowerCase()}/`)) {
+      return relative;
+    }
+    return relative ? `${galleryShare}/${relative}` : galleryShare;
+  };
+  const galleryRootPath = joinGalleryPath(config.remoteGalleryPath);
+  const suggestedGalleryRootPath = joinGalleryPath(config.suggestedGalleryPath);
 
   return (
     <div className={`app-shell${navCollapsed ? " collapsed" : ""}${showTree ? "" : " no-tree"}`}>
@@ -466,12 +490,15 @@ export default function App() {
         <FolderTree
           currentPath={filesPath}
           refreshToken={refreshToken}
+          share={config.smb.share}
           showFiles={config.treeShowFiles}
           onOpen={(path) => {
             setTab("files");
             setFilesOpenRequest({ path, token: Date.now() });
           }}
           onOpenFile={openTreeFile}
+          onSelectShare={(share) => void selectShare(share)}
+          onClearShare={() => void clearShare()}
           onClose={() => setTreeVisible(false)}
         />
       )}
@@ -500,6 +527,9 @@ export default function App() {
               android={config.android}
               viewMode={config.fileViewMode}
               onPathChange={setFilesPath}
+              share={config.smb.share}
+              onSelectShare={(share) => void selectShare(share)}
+              onClearShare={() => void clearShare()}
               onExternalEdit={(session) => {
                 if (config?.externalSaveEnabled) {
                   setExternalEdit(session);
@@ -513,8 +543,8 @@ export default function App() {
           {tab === "gallery" && (
             <GalleryView
               android={config.android}
-              remoteGalleryPath={config.remoteGalleryPath}
-              suggestedGalleryPath={config.suggestedGalleryPath}
+              remoteGalleryPath={galleryRootPath}
+              suggestedGalleryPath={suggestedGalleryRootPath}
               galleryColumns={config.galleryColumns}
               backToken={galleryBackToken}
               onPathChange={(_path, canGoBack) => setGalleryCanBack(canGoBack)}

@@ -18,7 +18,185 @@ mod zt_proxy;
 #[cfg(not(target_os = "android"))]
 mod zerotier_embedded;
 
+use std::io::Write;
+use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
+
+struct FileLogger {
+    file: Mutex<std::fs::File>,
+}
+
+impl log::Log for FileLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        if metadata.target().starts_with("zerosmb") {
+            metadata.level() <= log::Level::Info
+        } else {
+            metadata.level() <= log::Level::Warn
+        }
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or(0);
+        if let Ok(mut file) = self.file.lock() {
+            let _ = writeln!(
+                file,
+                "{timestamp} {:?} {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
+            let _ = file.flush();
+        }
+        #[cfg(not(target_os = "android"))]
+        eprintln!("{:?} {}: {}", record.level(), record.target(), record.args());
+    }
+
+    fn flush(&self) {
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.flush();
+        }
+    }
+}
+
+static LOGGER: OnceLock<FileLogger> = OnceLock::new();
+
+fn install_file_logger() {
+    let path = std::env::temp_dir().join("zerosmb.log");
+    if std::fs::metadata(&path)
+        .map(|metadata| metadata.len() > 4 * 1024 * 1024)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(&path);
+    }
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let logger = LOGGER.get_or_init(|| FileLogger {
+        file: Mutex::new(file),
+    });
+    if log::set_logger(logger).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+}
+
+#[cfg(windows)]
+fn install_native_crash_logger() {
+    let _ = std::fs::remove_file(std::env::temp_dir().join("zerosmb-native-crash.log"));
+    #[repr(C)]
+    struct ExceptionRecord {
+        code: u32,
+        flags: u32,
+        record: *mut ExceptionRecord,
+        address: *mut std::ffi::c_void,
+        number_parameters: u32,
+        information: [usize; 15],
+    }
+
+    #[repr(C)]
+    struct ExceptionPointers {
+        record: *mut ExceptionRecord,
+        context: *mut std::ffi::c_void,
+    }
+
+    unsafe extern "system" fn handler(info: *mut std::ffi::c_void) -> i32 {
+        let pointers = info as *mut ExceptionPointers;
+        if pointers.is_null() {
+            return 0;
+        }
+        let record = (*pointers).record;
+        let (code, address) = if record.is_null() {
+            (0, std::ptr::null_mut())
+        } else {
+            ((*record).code, (*record).address)
+        };
+        let mut frames = [std::ptr::null_mut(); 32];
+        let count = unsafe {
+            RtlCaptureStackBackTrace(
+                0,
+                frames.len() as u32,
+                frames.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::env::temp_dir().join("zerosmb-native-crash.log"))
+        {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(
+                file,
+                "native crash unix={timestamp} code=0x{code:08x} address=0x{:x} thread={}",
+                address as usize,
+                GetCurrentThreadId()
+            );
+            for frame in frames.iter().take(count as usize) {
+                let pc = *frame;
+                let mut base = std::ptr::null_mut();
+                unsafe {
+                    RtlPcToFileHeader(pc, &mut base);
+                }
+                if base.is_null() {
+                    let _ = writeln!(file, "  frame=0x{:x} module=?", pc as usize);
+                    continue;
+                }
+                let mut name = [0u16; 260];
+                let len = unsafe {
+                    GetModuleFileNameW(base as _, name.as_mut_ptr(), name.len() as u32)
+                } as usize;
+                let module = String::from_utf16_lossy(&name[..len]);
+                let _ = writeln!(
+                    file,
+                    "  frame=0x{:x} module={module}+0x{:x}",
+                    pc as usize,
+                    pc as usize - base as usize
+                );
+            }
+            let _ = file.flush();
+        }
+        0
+    }
+
+    extern "system" {
+        fn SetUnhandledExceptionFilter(
+            filter: Option<unsafe extern "system" fn(*mut std::ffi::c_void) -> i32>,
+        ) -> *mut std::ffi::c_void;
+        fn GetCurrentThreadId() -> u32;
+        fn RtlCaptureStackBackTrace(
+            frames_to_skip: u32,
+            frames_to_capture: u32,
+            backtrace: *mut *mut std::ffi::c_void,
+            backtrace_hash: *mut u32,
+        ) -> u16;
+        fn RtlPcToFileHeader(
+            pc_value: *mut std::ffi::c_void,
+            base_of_image: *mut *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        fn GetModuleFileNameW(
+            module: *mut std::ffi::c_void,
+            filename: *mut u16,
+            size: u32,
+        ) -> u32;
+    }
+
+    unsafe {
+        SetUnhandledExceptionFilter(Some(handler));
+    }
+}
 
 #[cfg(not(target_os = "android"))]
 pub fn zt_smoke() -> i32 {
@@ -36,15 +214,40 @@ pub fn zt_smoke() -> i32 {
     }
 }
 
+fn install_panic_logger() {
+    let path = std::env::temp_dir().join("zerosmb-crash.log");
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let location = info
+                .location()
+                .map(|location| format!("{}:{}", location.file(), location.line()))
+                .unwrap_or_else(|| "unknown".to_string());
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|value| value.to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown".to_string());
+            let _ = writeln!(
+                file,
+                "panic thread={:?} location={location} message={payload}",
+                std::thread::current().name()
+            );
+        }
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("zerosmb=info,smb=warn"),
-        )
-        .try_init();
-    }
+    install_file_logger();
+    install_panic_logger();
+    #[cfg(windows)]
+    install_native_crash_logger();
 
     let builder = tauri::Builder::default();
     #[cfg(not(target_os = "android"))]
@@ -81,9 +284,13 @@ pub fn run() {
             commands::save_settings,
             commands::pick_local_folder,
             commands::smb_list,
+            commands::select_smb_share,
+            commands::clear_smb_share,
+            commands::send_error_log,
             commands::delete_paths,
             commands::create_folder,
             commands::upload_files,
+            commands::upload_folder,
             commands::download_file,
             commands::read_text_file,
             preview::preview_document,

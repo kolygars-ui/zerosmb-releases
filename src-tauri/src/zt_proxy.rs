@@ -35,6 +35,21 @@ pub async fn effective_smb_config_for(
     mode: &str,
     network_id: &str,
 ) -> AppResult<SmbConfig> {
+    let zerotier_mode = app
+        .state::<AppState>()
+        .config()
+        .resolved_zerotier_mode()
+        .to_string();
+    effective_smb_config_with_provider(app, cfg, mode, network_id, &zerotier_mode).await
+}
+
+pub async fn effective_smb_config_with_provider(
+    app: &AppHandle,
+    cfg: &SmbConfig,
+    mode: &str,
+    network_id: &str,
+    zerotier_mode: &str,
+) -> AppResult<SmbConfig> {
     let state = app.state::<AppState>();
     match mode {
         "wireguard" => {
@@ -60,7 +75,16 @@ pub async fn effective_smb_config_for(
         "zerotier" if network_id.trim().is_empty() => {
             return Err(AppError::msg("Укажите ZeroTier Network ID"));
         }
-        "zerotier" => {}
+        "zerotier" => {
+            if zerotier_mode == "system" {
+                log::info!(
+                    "SMB proxy: using system ZeroTier for {}:{}",
+                    cfg.normalized_host(),
+                    cfg.port
+                );
+                return Ok(cfg.clone());
+            }
+        }
         _ => {
             // Local network mode: use normal OS sockets and the configured host.
             #[cfg(target_os = "android")]
@@ -104,12 +128,16 @@ pub async fn effective_smb_config_for(
         let host = cfg.normalized_host();
         let target_port = cfg.port;
         let network = network_id.trim().to_string();
+        log::info!(
+            "SMB proxy: mode=zerotier target={host}:{target_port} network={network}"
+        );
         let port = tokio::task::spawn_blocking(move || -> AppResult<u16> {
             zt.ensure(&network, roots.as_deref(), &storage, true)?;
             zt.start_proxy(&host, target_port)
         })
         .await
         .map_err(|error| AppError::msg(error.to_string()))??;
+        log::info!("SMB proxy: ready on 127.0.0.1:{port} -> {cfg_host}:{cfg_port}", cfg_host = cfg.normalized_host(), cfg_port = cfg.port);
         let mut local = cfg.clone();
         local.host = "127.0.0.1".to_string();
         local.port = port;

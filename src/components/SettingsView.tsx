@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+﻿import { useEffect, useState } from "react";
 import { api } from "../api";
 import type {
   AiStatus,
@@ -8,6 +8,7 @@ import type {
   SmbConfig,
   UpdateInfo,
   WireGuardStatus,
+  ZerotierMode,
   ZtStatus,
 } from "../types";
 import ConfirmDialog from "./ConfirmDialog";
@@ -48,10 +49,15 @@ function Toggle({
 export default function SettingsView({ android, config, onConfigChange }: Props) {
   const [smb, setSmb] = useState<SmbConfig>(config.smb);
   const [password, setPassword] = useState("");
+  const [galleryShare, setGalleryShare] = useState(config.galleryShare);
   const [galleryPath, setGalleryPath] = useState(config.remoteGalleryPath);
   const [galleryEnabled, setGalleryEnabled] = useState(config.galleryEnabled);
   const [galleryColumns, setGalleryColumns] = useState(config.galleryColumns);
   const [downloadDir, setDownloadDir] = useState(config.downloadDir);
+  const [diagnosticsPath, setDiagnosticsPath] = useState(config.diagnosticsPath);
+  const [diagnosticsPickerOpen, setDiagnosticsPickerOpen] = useState(false);
+  const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
+  const [diagnosticsInfo, setDiagnosticsInfo] = useState("");
   const [fileNameScale, setFileNameScale] = useState(config.fileNameScale);
   const [fileViewMode, setFileViewMode] = useState(config.fileViewMode);
   const [treeShowFiles, setTreeShowFiles] = useState(config.treeShowFiles);
@@ -89,6 +95,7 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
     config.connectionMode,
   );
   const [networkId, setNetworkId] = useState(config.zerotierNetworkId);
+  const [ztMode, setZtMode] = useState<ZerotierMode>(config.zerotierMode);
   const [updateRepo, setUpdateRepo] = useState(config.updateRepo);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -121,10 +128,12 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
 
   useEffect(() => {
     setSmb(config.smb);
+    setGalleryShare(config.galleryShare);
     setGalleryPath(config.remoteGalleryPath);
     setGalleryEnabled(config.galleryEnabled);
     setGalleryColumns(config.galleryColumns);
     setDownloadDir(config.downloadDir);
+    setDiagnosticsPath(config.diagnosticsPath);
     setFileNameScale(config.fileNameScale);
     setFileViewMode(config.fileViewMode);
     setTreeShowFiles(config.treeShowFiles);
@@ -147,6 +156,7 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
     setDownloadKeepStructure(config.downloadKeepStructure);
     setConnectionMode(config.connectionMode);
     setNetworkId(config.zerotierNetworkId);
+    setZtMode(config.zerotierMode);
     setUpdateRepo(config.updateRepo);
     setAiEnabled(config.aiEnabled);
     setAiAllowDownload(config.aiAllowDownload);
@@ -158,11 +168,14 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
   }, [config]);
 
   useEffect(() => {
-    void api.ztStatus().then(setZt).catch(() => undefined);
     void api.wireguardStatus().then(setWireguard).catch(() => undefined);
     void api.aiStatus().then(setAiStatus).catch(() => undefined);
-    void api.getPlanet().then(setPlanetInfo).catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    void api.ztStatus(ztMode).then(setZt).catch(() => undefined);
+    void api.getPlanet(ztMode).then(setPlanetInfo).catch(() => undefined);
+  }, [ztMode]);
 
   const updateSmb = <K extends keyof SmbConfig>(key: K, value: SmbConfig[K]) => {
     setSmb((current) => ({ ...current, [key]: value }));
@@ -176,10 +189,12 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
       const next = await api.saveSettings({
         smb,
         password: password.trim() || undefined,
+        galleryShare: galleryShare.trim(),
         remoteGalleryPath: galleryPath.trim(),
         galleryEnabled,
         galleryColumns,
         downloadDir,
+        diagnosticsPath,
         fileNameScale,
         fileViewMode,
         treeShowFiles,
@@ -202,6 +217,7 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
         downloadKeepStructure,
         zerotierNetworkId: networkId.trim(),
         connectionMode,
+        zerotierMode: ztMode,
         aiEnabled,
         aiAllowDownload,
         aiAllowModify,
@@ -219,6 +235,23 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
       setError(String(cause));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const sendErrorLog = async () => {
+    setDiagnosticsBusy(true);
+    setError("");
+    setDiagnosticsInfo("");
+    try {
+      if (!diagnosticsPath.trim()) {
+        throw new Error("Укажите папку на NAS для файла ошибок");
+      }
+      const message = await api.sendErrorLog(diagnosticsPath.trim());
+      setDiagnosticsInfo(message);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setDiagnosticsBusy(false);
     }
   };
 
@@ -273,9 +306,9 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
     setInfo("");
     try {
       if (password.trim()) {
-        await api.testConnection(smb, password, networkId.trim(), connectionMode);
+        await api.testConnection(smb, password, networkId.trim(), connectionMode, ztMode);
       } else {
-        await api.testConnectionSaved(smb, networkId.trim(), connectionMode);
+        await api.testConnectionSaved(smb, networkId.trim(), connectionMode, ztMode);
       }
       setInfo("Соединение установлено");
     } catch (cause) {
@@ -285,12 +318,21 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
     }
   };
 
+  const refreshZt = async () => {
+    try {
+      setZt(await api.ztStatus(ztMode));
+      setPlanetInfo(await api.getPlanet(ztMode));
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
+
   const join = async () => {
     setZtBusy(true);
     setError("");
     setInfo("");
     try {
-      const status = await api.ztJoin(networkId.trim());
+      const status = await api.ztJoin(networkId.trim(), ztMode);
       setZt(status);
       setInfo(status.message);
     } catch (cause) {
@@ -300,11 +342,11 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
     }
   };
 
-  const leave = async () => {
+  const leave = async (id = networkId) => {
     setZtBusy(true);
     setError("");
     try {
-      const status = await api.ztLeave(networkId.trim());
+      const status = await api.ztLeave(id.trim(), ztMode);
       setZt(status);
       setInfo("Сеть отключена");
     } catch (cause) {
@@ -408,12 +450,13 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
     setPlanetBusy(true);
     setPlanetMessage("");
     try {
-      const result = await api.pickPlanet();
+      const result = await api.pickPlanet(ztMode);
       setPlanetInfo(result);
       setPlanetMessage(
-        "planet сохранён. Нажмите «Подключить» в блоке ZeroTier, чтобы использовать только ваши корневые серверы.",
+        ztMode === "system"
+          ? "planet установлен в системный ZeroTier."
+          : "planet выбран. Нажмите «Переподключить» в карточке ZeroTier, чтобы использовать только свой корневой сервер.",
       );
-      onConfigChange(await api.getConfig());
     } catch (cause) {
       setPlanetMessage(String(cause));
     } finally {
@@ -425,10 +468,9 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
     setPlanetBusy(true);
     setPlanetMessage("");
     try {
-      const result = await api.clearPlanet();
+      const result = await api.clearPlanet(ztMode);
       setPlanetInfo(result);
       setPlanetMessage(result.message);
-      onConfigChange(await api.getConfig());
     } catch (cause) {
       setPlanetMessage(String(cause));
     } finally {
@@ -436,6 +478,14 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
     }
   };
   const isLinux = config.platform === "linux";
+  const planetReady =
+    ztMode === "system" ? planetInfo?.systemConfigured : planetInfo?.configured;
+  const planetRemovable =
+    ztMode === "system"
+      ? Boolean(planetInfo?.systemConfigured && planetInfo?.systemManaged)
+      : Boolean(planetInfo?.configured);
+  const planetSize =
+    ztMode === "system" ? planetInfo?.systemSize ?? 0 : planetInfo?.size ?? 0;
   return (
     <div className="stack">
       {error && <div className="error">{error}</div>}
@@ -1033,9 +1083,11 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
                   ? "ok"
                   : "warn"
                 : connectionMode === "zerotier"
-                  ? zt?.serviceOnline
+                  ? ztMode === "system" && android
                     ? "ok"
-                    : "warn"
+                    : zt?.serviceOnline
+                      ? "ok"
+                      : "warn"
                   : "ok"
             }`}
           >
@@ -1044,9 +1096,11 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
                 ? "подключён"
                 : "отключён"
               : connectionMode === "zerotier"
-                ? zt?.serviceOnline
-                  ? "online"
-                  : "offline"
+                ? ztMode === "system" && android
+                  ? "приложение"
+                  : zt?.serviceOnline
+                    ? "online"
+                    : "offline"
                 : "локально"}
           </span>
         </div>
@@ -1084,9 +1138,127 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
 
         {connectionMode === "zerotier" && (
           <div style={{ marginTop: 14 }}>
-            <div className="row">
+            <div className="setup-choices">
+              <button
+                className={`setup-choice ${ztMode === "system" ? "active" : ""}`}
+                onClick={() => setZtMode("system")}
+              >
+                <span className="setup-choice-title">
+                  Системный ZeroTier {android ? "" : "(рекомендуется)"}
+                </span>
+                <span className="setup-choice-text">
+                  {android
+                    ? "Приложение ZeroTier One"
+                    : "Установленный ZeroTier One, управление сетями здесь"}
+                </span>
+              </button>
+              <button
+                className={`setup-choice ${ztMode === "embedded" ? "active" : ""}`}
+                onClick={() => setZtMode("embedded")}
+              >
+                <span className="setup-choice-title">Встроенный модуль</span>
+                <span className="setup-choice-text">libzt внутри ZeroSMB</span>
+              </button>
+            </div>
+
+            {ztMode === "system" && (
+              <div className="hint" style={{ marginTop: 10 }}>
+                {android
+                  ? "На Android сети ZeroTier добавляются и удаляются в приложении ZeroTier One."
+                  : "ZeroSMB управляет установленным ZeroTier One: добавление и удаление сетей, установка planet."}
+              </div>
+            )}
+            {isLinux && ztMode === "system" && (
+              <div className="hint">
+                Поддерживается установка через apt (`zerotier-one`) и snap (`zerotier`).
+              </div>
+            )}
+            <div className="row" style={{ marginTop: 10 }}>
+              <button className="btn ghost" onClick={() => void api.ztOpenHelp()}>
+                {android ? "Открыть приложение ZeroTier" : "Скачать ZeroTier"}
+              </button>
+              <button className="btn" onClick={() => void refreshZt()} disabled={ztBusy}>
+                Обновить
+              </button>
+            </div>
+
+            {!(android && ztMode === "system") && (
+              <div
+                className="card"
+                style={{
+                  marginTop: 12,
+                  marginBottom: 12,
+                  background: "rgba(6, 10, 22, 0.35)",
+                }}
+              >
+                <div className="row">
+                  <div>
+                    <h3 style={{ marginBottom: 2 }}>Корневые серверы ZeroTier (planet)</h3>
+                    <span className="small muted">
+                      {ztMode === "system"
+                        ? "Свой planet для системного ZeroTier. Установка требует прав администратора."
+                        : "Свой planet для встроенного ZeroTier."}
+                    </span>
+                  </div>
+                  <span className="spacer" />
+                  <span className={`chip ${planetReady ? "ok" : "warn"}`}>
+                    {planetReady ? "свой planet" : "стандартные"}
+                  </span>
+                </div>
+                <div className="small" style={{ marginTop: 8 }}>
+                  {planetReady
+                    ? `Свой planet: ${planetSize} байт${
+                        ztMode === "system" && planetInfo?.systemWorldId
+                          ? ` · world ${planetInfo.systemWorldId}`
+                          : ""
+                      }`
+                    : "Свой planet не установлен — используются стандартные корни"}
+                </div>
+                {ztMode === "system" && planetInfo?.systemLocation && (
+                  <div className="hint mono" style={{ marginTop: 6 }}>
+                    {planetInfo.systemLocation}
+                  </div>
+                )}
+                {planetReady && ztMode === "system" && !planetRemovable && (
+                  <div className="hint" style={{ marginTop: 6 }}>
+                    planet уже изменён вручную; автоматическое удаление доступно только для
+                    planet, установленного через ZeroSMB.
+                  </div>
+                )}
+                <div className="row" style={{ marginTop: 10 }}>
+                  <button
+                    className="btn primary"
+                    onClick={() => void selectPlanet()}
+                    disabled={planetBusy}
+                  >
+                    {planetBusy ? "Чтение…" : "Выбрать planet…"}
+                  </button>
+                  {planetRemovable && (
+                    <button
+                      className="btn danger"
+                      onClick={() => void removePlanet()}
+                      disabled={planetBusy}
+                    >
+                      Удалить planet
+                    </button>
+                  )}
+                  {ztMode === "embedded" && planetReady && (
+                    <button
+                      className="btn"
+                      onClick={() => void join()}
+                      disabled={ztBusy || planetBusy}
+                    >
+                      Переподключить ZeroTier
+                    </button>
+                  )}
+                </div>
+                {planetMessage && <div className="hint" style={{ marginTop: 8 }}>{planetMessage}</div>}
+              </div>
+            )}
+
+            <div className="row" style={{ marginTop: 12 }}>
               <div className="field" style={{ flex: 1, minWidth: 220 }}>
-                <label>Network ID</label>
+                <label>Network ID <span className="req">*</span></label>
                 <input
                   value={networkId}
                   onChange={(event) => setNetworkId(event.target.value)}
@@ -1095,26 +1267,38 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
                 />
                 <span className="hint">
                   {zt?.available
-                    ? `Встроенный ZeroTier${zt.version ? ` · ${zt.version}` : ""}${zt.address ? ` · ${zt.address}` : ""}`
-                    : "Встроенный ZeroTier будет запущен при подключении"}
+                    ? `${ztMode === "system" ? "Системный" : "Встроенный"} ZeroTier${
+                        zt.version ? ` · ${zt.version}` : ""
+                      }${zt.address ? ` · ${zt.address}` : ""}`
+                    : zt?.message ||
+                      (ztMode === "system"
+                        ? "ZeroTier One не найден или служба не запущена"
+                        : "Встроенный ZeroTier будет запущен при подключении")}
                 </span>
               </div>
-              <button
-                className="btn primary"
-                onClick={() => void join()}
-                disabled={ztBusy || !networkId.trim()}
-              >
-                Подключить
-              </button>
-              {!android && (
-                <button className="btn" onClick={() => void leave()} disabled={ztBusy}>
-                  Отключить
+              {ztMode === "system" && android ? (
+                <button
+                  className="btn primary"
+                  onClick={() => void api.ztOpenAndroid(networkId.trim())}
+                  disabled={!networkId.trim()}
+                >
+                  Открыть ZeroTier
                 </button>
-              )}
-              {!android && (
-                <button className="btn ghost" onClick={() => void api.ztOpenHelp()}>
-                  Помощь
-                </button>
+              ) : (
+                <>
+                  <button
+                    className="btn primary"
+                    onClick={() => void join()}
+                    disabled={ztBusy || !networkId.trim()}
+                  >
+                    {ztMode === "system" ? "Добавить сеть" : "Подключить"}
+                  </button>
+                  {!android && (
+                    <button className="btn" onClick={() => void leave()} disabled={ztBusy}>
+                      Отключить
+                    </button>
+                  )}
+                </>
               )}
             </div>
             {zt?.networks?.length ? (
@@ -1130,9 +1314,24 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
                           : ""}
                       </div>
                     </div>
-                    <span className={`chip ${network.status === "OK" ? "ok" : "warn"}`}>
-                      {network.status}
-                    </span>
+                    <div className="row">
+                      <span
+                        className={`chip ${
+                          network.status === "OK" || network.status === "APP" ? "ok" : "warn"
+                        }`}
+                      >
+                        {network.status === "APP" ? "в приложении" : network.status}
+                      </span>
+                      {!android && ztMode === "system" && (
+                        <button
+                          className="btn danger ghost"
+                          onClick={() => void leave(network.id)}
+                          disabled={ztBusy}
+                        >
+                          Удалить
+                        </button>
+                      )}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -1204,40 +1403,6 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
         </div>
       </div>
 
-      {connectionMode === "zerotier" && (
-      <div className="card">
-        <h3>Корневые серверы ZeroTier (planet)</h3>
-        <p className="muted small">
-          Можно отключить встроенные планеты ZeroTier и использовать только свой
-          root-сервер (файл <span className="mono">planet</span>). Файл применяется при
-          следующем подключении ZeroTier.
-        </p>
-        <div className="small" style={{ marginTop: 8 }}>
-          {planetInfo?.configured
-            ? `Свой planet: ${planetInfo.size} байт`
-            : "Свой planet не выбран — используются встроенные корни"}
-        </div>
-        <div className="row" style={{ marginTop: 12 }}>
-          <button className="btn" onClick={() => void selectPlanet()} disabled={planetBusy}>
-            {planetBusy ? "Чтение…" : "Выбрать planet…"}
-          </button>
-          {planetInfo?.configured && (
-            <button className="btn danger" onClick={() => void removePlanet()} disabled={planetBusy}>
-              Удалить planet
-            </button>
-          )}
-          <button className="btn" onClick={() => void join()} disabled={ztBusy || planetBusy}>
-            Переподключить ZeroTier
-          </button>
-        </div>
-        {planetMessage && <div className="hint" style={{ marginTop: 10 }}>{planetMessage}</div>}
-        <div className="hint" style={{ marginTop: 8 }}>
-          Удаление своего planet возвращает встроенные корни только после перезапуска
-          приложения. Размер planet — до 4096 байт.
-        </div>
-      </div>
-      )}
-
       <div className="card">
         <h3>NAS / SMB</h3>
         {connectionMode === "local" && (
@@ -1259,15 +1424,20 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
         )}
         <div className="grid two">
           <div className="field">
-            <label>Host / IP</label>
+            <label>Host / IP <span className="req">*</span></label>
             <input value={smb.host} onChange={(e) => updateSmb("host", e.target.value)} />
           </div>
           <div className="field">
             <label>Share</label>
-            <input value={smb.share} onChange={(e) => updateSmb("share", e.target.value)} />
+            <input
+              value={smb.share}
+              onChange={(e) => updateSmb("share", e.target.value)}
+              placeholder="Оставьте пустым для всех шеров"
+            />
+            <span className="hint">Пусто — показать все доступные шеры.</span>
           </div>
           <div className="field">
-            <label>Порт</label>
+            <label>Порт <span className="req">*</span></label>
             <input
               type="number"
               value={smb.port}
@@ -1279,7 +1449,7 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
             <input value={smb.domain} onChange={(e) => updateSmb("domain", e.target.value)} />
           </div>
           <div className="field">
-            <label>Пользователь</label>
+            <label>Пользователь <span className="req">*</span></label>
             <input
               value={smb.username}
               onChange={(e) => updateSmb("username", e.target.value)}
@@ -1305,6 +1475,19 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
             />
           </div>
           <div className="field">
+            <label>Share для галереи</label>
+            <input
+              value={galleryShare}
+              onChange={(e) => setGalleryShare(e.target.value)}
+              placeholder={smb.share || "Например, NAS"}
+              spellCheck={false}
+            />
+            <span className="hint">
+              Пусто — использовать основной Share. Укажите шар, чтобы все фото и
+              резервные копии хранились на нём.
+            </span>
+          </div>
+          <div className="field">
             <label>Папка галереи на NAS</label>
             <input
               value={galleryPath}
@@ -1313,8 +1496,7 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
               spellCheck={false}
             />
             <span className="hint">
-              По умолчанию: Корень / пользователь SMB / Галерея. Внутри сохраняются
-              папки альбомов телефона.
+              Путь внутри выбранного шара. Внутри сохраняются папки альбомов телефона.
             </span>
           </div>
         </div>
@@ -1375,6 +1557,44 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
       </div>
 
       <div className="card">
+        <h3>Диагностика</h3>
+        <p className="muted small">
+          Отправляет файл с ошибками в выбранную папку на NAS. Работает на ПК и Android.
+        </p>
+        <div className="field" style={{ marginTop: 10 }}>
+          <label>Папка для файла ошибок</label>
+          <div className="row">
+            <input
+              value={diagnosticsPath}
+              onChange={(event) => setDiagnosticsPath(event.target.value)}
+              placeholder="Share/Diagnostics"
+              spellCheck={false}
+            />
+            <button
+              className="btn"
+              onClick={() => setDiagnosticsPickerOpen(true)}
+              disabled={diagnosticsBusy}
+            >
+              Выбрать папку
+            </button>
+          </div>
+          <span className="hint">
+            Если Share не задан, укажите путь вместе с шаром: Share/Папка.
+          </span>
+        </div>
+        <div className="row" style={{ marginTop: 12 }}>
+          <button
+            className="btn primary"
+            onClick={() => void sendErrorLog()}
+            disabled={diagnosticsBusy}
+          >
+            {diagnosticsBusy ? "Отправка..." : "Отправить файл ошибок"}
+          </button>
+          {diagnosticsInfo && <span className="small muted">{diagnosticsInfo}</span>}
+        </div>
+      </div>
+
+      <div className="card">
         <h3>О приложении</h3>
         <div className="small muted">
           ZeroSMB {config.platform === "android" ? "Android" : config.platform} · Rust + Tauri ·
@@ -1405,6 +1625,15 @@ export default function SettingsView({ android, config, onConfigChange }: Props)
             current.includes(path) ? current : [...current, path],
           );
           setAiDenyPickerOpen(false);
+        }}
+      />
+      <FolderPickerDialog
+        open={diagnosticsPickerOpen}
+        title="Папка для файла ошибок"
+        onCancel={() => setDiagnosticsPickerOpen(false)}
+        onSelect={(path) => {
+          setDiagnosticsPath(path);
+          setDiagnosticsPickerOpen(false);
         }}
       />
       <ConfirmDialog

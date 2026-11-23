@@ -30,13 +30,16 @@ export interface SyncJob {
 }
 
 export type ConnectionMode = "local" | "zerotier" | "wireguard";
+export type ZerotierMode = "embedded" | "system";
 
 export interface PublicConfig {
   setupComplete: boolean;
   zerotierNetworkId: string;
   connectionMode: ConnectionMode;
+  zerotierMode: ZerotierMode;
   smb: SmbConfig;
   syncJobs: SyncJob[];
+  galleryShare: string;
   remoteGalleryPath: string;
   suggestedGalleryPath: string;
   galleryEnabled: boolean;
@@ -50,6 +53,7 @@ export interface PublicConfig {
   externalSaveEnabled: boolean;
   externalSaveMode: "auto" | "button" | string;
   downloadDir: string;
+  diagnosticsPath: string;
   downloadAutoSave: boolean;
   downloadKeepStructure: boolean;
   systemInstallDir: string;
@@ -84,6 +88,7 @@ export interface PublicConfig {
 export interface SetupInput {
   zerotierNetworkId: string;
   connectionMode?: ConnectionMode;
+  zerotierMode?: ZerotierMode;
   smb: SmbConfig;
   password: string;
   remoteGalleryPath?: string;
@@ -105,6 +110,7 @@ export interface SetupInput {
 export interface SettingsInput {
   smb: SmbConfig;
   password?: string;
+  galleryShare?: string;
   remoteGalleryPath?: string;
   galleryEnabled?: boolean;
   galleryColumns?: number;
@@ -117,6 +123,7 @@ export interface SettingsInput {
   externalSaveEnabled?: boolean;
   externalSaveMode?: "auto" | "button";
   downloadDir?: string;
+  diagnosticsPath?: string;
   downloadAutoSave?: boolean;
   downloadKeepStructure?: boolean;
   systemInstallDir?: string;
@@ -133,6 +140,7 @@ export interface SettingsInput {
   wireguardEnabled?: boolean;
   zerotierNetworkId?: string;
   connectionMode?: ConnectionMode;
+  zerotierMode?: ZerotierMode;
   aiEnabled?: boolean;
   aiAllowDownload?: boolean;
   aiAllowModify?: boolean;
@@ -205,6 +213,7 @@ export interface FileEntry {
   name: string;
   path: string;
   isDir: boolean;
+  isShare?: boolean;
   size: number;
   modified: number;
   extension: string;
@@ -278,6 +287,12 @@ export interface PlanetInfo {
   configured: boolean;
   customRoots: boolean;
   size: number;
+  systemConfigured: boolean;
+  systemSupported: boolean;
+  systemManaged: boolean;
+  systemSize: number;
+  systemWorldId: number | null;
+  systemLocation: string | null;
   message: string;
 }
 

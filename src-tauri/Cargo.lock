@@ -7596,7 +7596,7 @@ dependencies = [
 
 [[package]]
 name = "zerosmb"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -7612,6 +7612,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smb",
+ "smb-rpc",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

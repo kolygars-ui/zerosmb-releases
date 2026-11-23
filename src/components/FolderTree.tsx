@@ -1,13 +1,16 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, kindOfName } from "../api";
 import type { FileEntry } from "../types";
 
 interface Props {
   currentPath: string;
   refreshToken: number;
+  share: string;
   showFiles: boolean;
   onOpen: (path: string) => void;
   onOpenFile: (entry: FileEntry) => void;
+  onSelectShare: (share: string) => void;
+  onClearShare: () => void;
   onClose: () => void;
 }
 
@@ -37,6 +40,7 @@ function TreeNode({
   showFiles,
   onOpen,
   onOpenFile,
+  onSelectShare,
 }: {
   entry: FileEntry;
   depth: number;
@@ -45,19 +49,16 @@ function TreeNode({
   showFiles: boolean;
   onOpen: (path: string) => void;
   onOpenFile: (entry: FileEntry) => void;
+  onSelectShare: (share: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [children, setChildren] = useState<FileEntry[]>([]);
+  const nodeRef = useRef<HTMLDivElement | null>(null);
 
-  const toggle = async () => {
+  const loadChildren = async (force = false) => {
     if (!entry.isDir) return;
-    if (expanded) {
-      setExpanded(false);
-      return;
-    }
-    setExpanded(true);
-    if (children.length > 0) return;
+    if (!force && children.length > 0) return;
     setLoading(true);
     try {
       const list = await api.smbList(entry.path);
@@ -69,18 +70,37 @@ function TreeNode({
     }
   };
 
+  const toggle = async () => {
+    if (!entry.isDir) return;
+    if (expanded) {
+      setExpanded(false);
+      return;
+    }
+    setExpanded(true);
+    void loadChildren();
+  };
+
   useEffect(() => {
-    setChildren([]);
-    setExpanded(false);
-  }, [showFiles, refreshToken]);
+    if (!entry.isDir) return;
+    const relevant =
+      currentPath === entry.path || currentPath.startsWith(`${entry.path}/`);
+    if (!relevant) return;
+    setExpanded(true);
+    void loadChildren(true);
+    if (currentPath === entry.path) {
+      nodeRef.current?.scrollIntoView({ block: "nearest" });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPath, entry.path, entry.isDir, showFiles, refreshToken]);
 
   return (
     <div>
       <div
+        ref={nodeRef}
         className={`tree-node ${currentPath === entry.path ? "active" : ""}`}
         style={{ paddingLeft: 8 + depth * 14 }}
       >
-        {entry.isDir ? (
+        {entry.isDir && !entry.isShare ? (
           <button className="tree-caret" onClick={() => void toggle()}>
             {expanded ? "▾" : "▸"}
           </button>
@@ -90,7 +110,9 @@ function TreeNode({
         <button
           className={`tree-label ${entry.isDir ? "tree-folder-label" : "tree-file-label"}`}
           onClick={() => {
-            if (entry.isDir) {
+            if (entry.isShare) {
+              onSelectShare(entry.name);
+            } else if (entry.isDir) {
               onOpen(entry.path);
               if (!expanded) void toggle();
             } else {
@@ -113,7 +135,7 @@ function TreeNode({
       {expanded &&
         children.map((child) => (
           <TreeNode
-            key={`${refreshToken}-${child.path}`}
+            key={child.path}
             entry={child}
             depth={depth + 1}
             currentPath={currentPath}
@@ -121,6 +143,7 @@ function TreeNode({
             showFiles={showFiles}
             onOpen={onOpen}
             onOpenFile={onOpenFile}
+            onSelectShare={onSelectShare}
           />
         ))}
     </div>
@@ -130,9 +153,12 @@ function TreeNode({
 export default function FolderTree({
   currentPath,
   refreshToken,
+  share,
   showFiles,
   onOpen,
   onOpenFile,
+  onSelectShare,
+  onClearShare,
   onClose,
 }: Props) {
   const [entries, setEntries] = useState<FileEntry[]>([]);
@@ -146,7 +172,11 @@ export default function FolderTree({
       const list = await api.smbList("");
       setEntries(sortEntries(showFiles ? list : list.filter((item) => item.isDir)));
     } catch (cause) {
-      setError(String(cause));
+      if (share) {
+        setError(String(cause));
+      } else {
+        setEntries([]);
+      }
     } finally {
       setLoading(false);
     }
@@ -155,7 +185,7 @@ export default function FolderTree({
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshToken, showFiles]);
+  }, [refreshToken, showFiles, share]);
 
   return (
     <aside className="tree-panel">
@@ -169,6 +199,15 @@ export default function FolderTree({
         >
           {loading ? "…" : "⟳"}
         </button>
+        {share && (
+          <button
+            className="btn ghost small"
+            onClick={onClearShare}
+            title="Все шеры"
+          >
+            ⌂
+          </button>
+        )}
         <button
           className="btn ghost small"
           onClick={onClose}
@@ -181,7 +220,7 @@ export default function FolderTree({
       <div className="tree-list">
         {entries.map((entry) => (
           <TreeNode
-            key={`${refreshToken}-${entry.path}`}
+            key={entry.path}
             entry={entry}
             depth={0}
             currentPath={currentPath}
@@ -189,6 +228,7 @@ export default function FolderTree({
             showFiles={showFiles}
             onOpen={onOpen}
             onOpenFile={onOpenFile}
+            onSelectShare={onSelectShare}
           />
         ))}
       </div>

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+﻿import { useEffect, useState } from "react";
 import { api } from "../api";
 import CloudMark from "./CloudMark";
 import type {
@@ -8,6 +8,7 @@ import type {
   RuntimeInfo,
   SmbConfig,
   WireGuardStatus,
+  ZerotierMode,
   ZtStatus,
 } from "../types";
 
@@ -27,6 +28,7 @@ const emptySmb: SmbConfig = {
 export default function SetupWizard({ onDone }: Props) {
   const [step, setStep] = useState(0);
   const [mode, setMode] = useState<ConnectionMode>("local");
+  const [ztMode, setZtMode] = useState<ZerotierMode>("system");
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
   const [networkId, setNetworkId] = useState("");
   const [zt, setZt] = useState<ZtStatus | null>(null);
@@ -62,10 +64,18 @@ export default function SetupWizard({ onDone }: Props) {
 
   useEffect(() => {
     void api.runtimeInfo().then(setRuntime).catch(() => undefined);
-    void api.ztStatus().then(setZt).catch(() => undefined);
-    void api.getPlanet().then(setPlanetInfo).catch(() => undefined);
     void api.wireguardStatus().then(setWireguard).catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    if (!runtime) return;
+    setZtMode(runtime.android ? "embedded" : "system");
+  }, [runtime]);
+
+  useEffect(() => {
+    void api.ztStatus(ztMode).then(setZt).catch(() => undefined);
+    void api.getPlanet(ztMode).then(setPlanetInfo).catch(() => undefined);
+  }, [ztMode]);
 
   const updateSmb = <K extends keyof SmbConfig>(key: K, value: SmbConfig[K]) => {
     setSmb((current) => ({ ...current, [key]: value }));
@@ -87,7 +97,7 @@ export default function SetupWizard({ onDone }: Props) {
     }
     setZtBusy(true);
     try {
-      const status = await api.ztJoin(networkId.trim());
+      const status = await api.ztJoin(networkId.trim(), ztMode);
       setZt(status);
       setZtMessage(status.message);
       setInfo(status.message);
@@ -105,9 +115,13 @@ export default function SetupWizard({ onDone }: Props) {
     setError("");
     setInfo("");
     try {
-      const info = await api.pickPlanet();
+      const info = await api.pickPlanet(ztMode);
       setPlanetInfo(info);
-      setInfo("Свой planet выбран. Переподключите ZeroTier, чтобы применить.");
+      setInfo(
+        ztMode === "system"
+          ? "Файл planet установлен в системный ZeroTier."
+          : "Свой planet выбран. Переподключите ZeroTier, чтобы применить.",
+      );
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -120,7 +134,7 @@ export default function SetupWizard({ onDone }: Props) {
     setError("");
     setInfo("");
     try {
-      const info = await api.clearPlanet();
+      const info = await api.clearPlanet(ztMode);
       setPlanetInfo(info);
       setInfo(info.message);
     } catch (cause) {
@@ -211,7 +225,7 @@ export default function SetupWizard({ onDone }: Props) {
       if (mode === "wireguard" && !wireguard?.connected) {
         if (!(await connectWireGuard())) return;
       }
-      await api.testConnection(smb, password, networkId.trim(), mode);
+      await api.testConnection(smb, password, networkId.trim(), mode, ztMode);
       setInfo("SMB-соединение установлено, доступ к ресурсу есть.");
     } catch (cause) {
       setError(String(cause));
@@ -232,6 +246,7 @@ export default function SetupWizard({ onDone }: Props) {
       const config = await api.saveSetup({
         zerotierNetworkId: networkId.trim(),
         connectionMode: mode,
+        zerotierMode: ztMode,
         smb,
         password,
         remoteGalleryPath: galleryPath.trim(),
@@ -295,8 +310,8 @@ export default function SetupWizard({ onDone }: Props) {
               <button className="setup-choice" onClick={() => chooseMode("zerotier")}>
                 <span className="setup-choice-title">ZeroTier</span>
                 <span className="setup-choice-text">
-                  Виртуальная сеть через Network ID. Устройство нужно авторизовать в
-                  ZeroTier Central.
+                  Системный или встроенный ZeroTier через Network ID. Сервис нужно
+                  авторизовать в ZeroTier Central.
                 </span>
               </button>
               <button className="setup-choice" onClick={() => chooseMode("wireguard")}>
@@ -321,12 +336,56 @@ export default function SetupWizard({ onDone }: Props) {
             <div>
               <h3>2. Сеть ZeroTier</h3>
               <p className="muted small">
-                Укажите Network ID вашей сети. ZeroTier встроен прямо в ZeroSMB на всех
-                платформах. Не забудьте авторизовать устройство в ZeroTier Central.
+                Выберите, какой ZeroTier использовать для подключения к NAS. Системный
+                рекомендуется на Windows и Linux: он работает отдельно и не нагружает
+                процесс ZeroSMB.
               </p>
             </div>
+            <div className="setup-choices">
+              <button
+                className={`setup-choice ${ztMode === "system" ? "active" : ""}`}
+                onClick={() => setZtMode("system")}
+              >
+                <span className="setup-choice-title">
+                  Системный ZeroTier {isAndroid ? "" : "(рекомендуется)"}
+                </span>
+                <span className="setup-choice-text">
+                  {isAndroid
+                    ? "Откроется приложение ZeroTier One. Сеть и planet настраиваются в нём."
+                    : "Установленный ZeroTier One. Управление сетями и planet доступно здесь."}
+                </span>
+              </button>
+              <button
+                className={`setup-choice ${ztMode === "embedded" ? "active" : ""}`}
+                onClick={() => setZtMode("embedded")}
+              >
+                <span className="setup-choice-title">Встроенный модуль</span>
+                <span className="setup-choice-text">
+                  libzt работает внутри ZeroSMB. Ничего устанавливать не нужно.
+                </span>
+              </button>
+            </div>
+            {ztMode === "system" && (
+              <div className="hint">
+                {isAndroid
+                  ? "На Android ZeroSMB не управляет сетями ZeroTier: добавьте сеть и авторизуйте устройство в приложении ZeroTier One."
+                  : "Для этого режима нужен установленный и запущенный ZeroTier One."}
+              </div>
+            )}
+            {isLinux && ztMode === "system" && (
+              <div className="hint">
+                Поддерживаются оба варианта установки:{" "}
+                <span className="mono">sudo apt install zerotier-one</span> или{" "}
+                <span className="mono">sudo snap install zerotier</span>.
+              </div>
+            )}
+            <div className="row">
+              <button className="btn ghost" onClick={() => void api.ztOpenHelp()}>
+                {isAndroid ? "Открыть приложение ZeroTier" : "Скачать ZeroTier"}
+              </button>
+            </div>
             <div className="field">
-              <label>ZeroTier Network ID</label>
+              <label>ZeroTier Network ID <span className="req">*</span></label>
               <input
                 value={networkId}
                 onChange={(event) => setNetworkId(event.target.value)}
@@ -338,13 +397,12 @@ export default function SetupWizard({ onDone }: Props) {
             </div>
             <div className="row">
               <button className="btn primary" onClick={() => void connectZt()} disabled={ztBusy}>
-                {ztBusy ? "Подключение…" : "Подключить сеть"}
+                {ztBusy
+                  ? "Подключение…"
+                  : ztMode === "system" && isAndroid
+                    ? "Открыть ZeroTier"
+                    : "Подключить сеть"}
               </button>
-              {!isAndroid && (
-                <button className="btn ghost" onClick={() => void api.ztOpenHelp()}>
-                  Скачать ZeroTier
-                </button>
-              )}
               <span className="spacer" />
               <button className="btn ghost" onClick={() => setStep(0)}>
                 Назад
@@ -354,45 +412,54 @@ export default function SetupWizard({ onDone }: Props) {
               </button>
             </div>
 
-            <div className="field" style={{ marginTop: 4 }}>
-              <label>Корневой сервер ZeroTier (planet)</label>
-              <span className="hint">
-                {planetInfo?.configured
-                  ? `Свой planet: ${planetInfo.size} байт`
-                  : "Используются встроенные корни ZeroTier"}
-              </span>
-              <div className="row" style={{ marginTop: 6 }}>
-                <button
-                  className="btn primary"
-                  onClick={() => void pickPlanet()}
-                  disabled={planetBusy}
-                >
-                  {planetBusy ? "Чтение…" : "Выбрать planet"}
-                </button>
-                {planetInfo?.configured && (
+            {!(isAndroid && ztMode === "system") && (
+              <div className="field" style={{ marginTop: 4 }}>
+                <label>Корневой сервер ZeroTier (planet)</label>
+                <span className="hint">
+                  {ztMode === "system"
+                    ? planetInfo?.systemConfigured
+                      ? `Свой planet установлен в систему: ${planetInfo.size} байт`
+                      : "Используются стандартные корни системного ZeroTier"
+                    : planetInfo?.configured
+                      ? `Свой planet: ${planetInfo.size} байт`
+                      : "Используются встроенные корни ZeroTier"}
+                </span>
+                <div className="row" style={{ marginTop: 6 }}>
                   <button
-                    className="btn danger ghost"
-                    onClick={() => void clearPlanet()}
+                    className="btn primary"
+                    onClick={() => void pickPlanet()}
                     disabled={planetBusy}
                   >
-                    Убрать
+                    {planetBusy ? "Чтение…" : "Выбрать planet"}
                   </button>
-                )}
-                {planetInfo?.configured && (
-                  <button
-                    className="btn"
-                    onClick={() => void connectZt()}
-                    disabled={ztBusy || !networkId.trim()}
-                  >
-                    Переподключить
-                  </button>
-                )}
+                  {(ztMode === "system"
+                    ? planetInfo?.systemConfigured
+                    : planetInfo?.configured) && (
+                    <button
+                      className="btn danger ghost"
+                      onClick={() => void clearPlanet()}
+                      disabled={planetBusy}
+                    >
+                      Убрать
+                    </button>
+                  )}
+                  {ztMode === "embedded" && planetInfo?.configured && (
+                    <button
+                      className="btn"
+                      onClick={() => void connectZt()}
+                      disabled={ztBusy || !networkId.trim()}
+                    >
+                      Переподключить
+                    </button>
+                  )}
+                </div>
+                <span className="hint">
+                  {ztMode === "system"
+                    ? "planet будет установлен в системный ZeroTier One (потребуются права администратора) и применится после перезапуска службы."
+                    : "Необязательно. Свой planet заменяет корневые серверы ZeroTier и применяется после переподключения сети."}
+                </span>
               </div>
-              <span className="hint">
-                Необязательно. Свой planet заменяет корневые серверы ZeroTier и
-                применяется после переподключения сети.
-              </span>
-            </div>
+            )}
             {ztMessage && <div className="hint">{ztMessage}</div>}
             {zt?.address && <div className="hint mono">Node ID: {zt.address}</div>}
             {zt && zt.networks.length > 0 && (
@@ -406,17 +473,26 @@ export default function SetupWizard({ onDone }: Props) {
                       <div className="mono">{network.id}</div>
                       <div className="small muted">{network.name || "Без названия"}</div>
                     </div>
-                    <span className={`chip ${network.status === "OK" ? "ok" : "warn"}`}>
-                      {network.status}
+                    <span
+                      className={`chip ${
+                        network.status === "OK" || network.status === "APP" ? "ok" : "warn"
+                      }`}
+                    >
+                      {network.status === "APP" ? "в приложении" : network.status}
                     </span>
                   </div>
                 ))}
               </div>
             )}
-            {zt && !zt.available && !isAndroid && (
+            {zt && !zt.available && !isAndroid && ztMode === "embedded" && (
               <div className="hint">
                 Встроенный ZeroTier ещё не запущен. Нажмите «Подключить сеть» — приложение
                 поднимет его автоматически.
+              </div>
+            )}
+            {zt && !zt.available && !isAndroid && ztMode === "system" && (
+              <div className="hint">
+                ZeroTier One не найден. Установите его по ссылке выше и запустите службу.
               </div>
             )}
           </div>
@@ -502,7 +578,7 @@ export default function SetupWizard({ onDone }: Props) {
             </div>
             <div className="grid two">
               <div className="field">
-                <label>Host / IP NAS</label>
+                <label>Host / IP NAS <span className="req">*</span></label>
                 <input
                   value={smb.host}
                   onChange={(event) => updateSmb("host", event.target.value)}
@@ -515,12 +591,12 @@ export default function SetupWizard({ onDone }: Props) {
                 <input
                   value={smb.share}
                   onChange={(event) => updateSmb("share", event.target.value)}
-                  placeholder="media"
+                  placeholder="Оставьте пустым для всех шеров"
                   spellCheck={false}
                 />
               </div>
               <div className="field">
-                <label>Порт</label>
+                <label>Порт <span className="req">*</span></label>
                 <input
                   type="number"
                   value={smb.port}
@@ -537,7 +613,7 @@ export default function SetupWizard({ onDone }: Props) {
                 />
               </div>
               <div className="field">
-                <label>Пользователь SMB</label>
+                <label>Пользователь SMB <span className="req">*</span></label>
                 <input
                   value={smb.username}
                   onChange={(event) => updateSmb("username", event.target.value)}

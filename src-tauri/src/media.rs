@@ -1,5 +1,4 @@
 use crate::error::{AppError, AppResult};
-use crate::smb_service::normalize_rel;
 use crate::state::AppState;
 use crate::zt_proxy;
 use http::header::{self, HeaderMap, HeaderValue};
@@ -52,11 +51,11 @@ async fn serve_smb(
     headers: &HeaderMap,
 ) -> AppResult<Response<Vec<u8>>> {
     let state = app.state::<AppState>();
-    let cfg = state.smb_config();
-    let network_id = state.config().zerotier_network_id;
+    let app_cfg = state.config();
+    let network_id = app_cfg.zerotier_network_id.clone();
+    let (cfg, rel, _) = crate::commands::resolve_remote_path(&app_cfg, relative)?;
     let effective = zt_proxy::effective_smb_config(app, &cfg, &network_id).await?;
     let password = state.password()?;
-    let rel = normalize_rel(relative);
     if rel.is_empty() {
         return Err(AppError::msg("Пустой путь к файлу"));
     }
